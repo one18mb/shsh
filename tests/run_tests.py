@@ -685,8 +685,8 @@ def test_ctrl_c_interrupts_command():
         clear_sockdir()
 
 
-def test_ctrl_d_keeps_foreground_job():
-    """运行中 ^D：人离开、执行权移交，但前台作业不被挂断"""
+def test_ctrl_d_hangs_up_foreground_job():
+    """运行中 ^D：离开并挂断前台作业（与掉线统一策略），执行权移交"""
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -697,20 +697,39 @@ def test_ctrl_d_keeps_foreground_job():
         bob.assert_contains(ps1("alice"))
         time.sleep(0.2)
 
-        alice.send('sh -c "sleep 77"\n')
+        alice.send("sleep 7777\n")
         time.sleep(0.6)
-        alice.send(b"\x04")  # ^D 干净离开
+        alice.send(b"\x04")  # ^D：离开会话并挂断前台作业
         assert alice.wait() == 0
-        time.sleep(0.4)
+        time.sleep(0.5)
 
-        # 前台 sleep 仍存活（^D 不发任何信号），且执行权已转给 bob
-        pg = subprocess.run("pgrep -f 'sleep 77'", shell=True,
-                            capture_output=True)
-        assert pg.returncode == 0, "^D 不应挂断前台作业"
+        # 前台 sleep 应已被 SIGHUP 挂断；执行权转给 bob 并回到 PS1
         bob.assert_contains(ps1("bob"), timeout=5)
+        pg = subprocess.run(["pgrep", "-f", "sleep 7777"],
+                            capture_output=True)
+        assert pg.returncode != 0, "^D 应挂断前台作业"
     finally:
-        subprocess.run("pkill -f 'sleep 77'", shell=True)
+        subprocess.run(["pkill", "-f", "sleep 7777"])
         kill_all([d, alice, bob])
+        clear_sockdir()
+
+
+def test_raw_program_termios_restored():
+    """前台程序改过 termios（raw）后退出：会话层回空闲即复位行规程"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        alice.send("stty -icanon -echo\n")
+        time.sleep(0.4)
+        alice.send("echo RESTOREME\n")
+        # 复位后应恢复输入回显（"echo RESTOREME" 本身出现在共享流中）
+        alice.assert_contains("echo RESTOREME", timeout=5)
+        alice.assert_contains("RESTOREME\r\n", timeout=5)
+    finally:
+        kill_all([d, alice])
         clear_sockdir()
 
 

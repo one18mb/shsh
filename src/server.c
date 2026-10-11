@@ -52,7 +52,6 @@ typedef struct client {
     bool want_close; /* 输出排空后关闭 */
     bool out_armed;  /* epoll 已注册 EPOLLOUT */
     bool dead;
-    bool clean_leave; /* ^D/exit：干净离开，不挂断前台作业 */
     uint16_t rows, cols;
     buf_t in, out;
     struct client *next;
@@ -352,8 +351,9 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
         *pp = c->next;
 
     if (c->has_name && c->id == s->executor_id) {
-        /* 执行者离开：网络掉线先挂断前台作业；^D/exit 干净离开则保留作业 */
-        if (s->running && !c->clean_leave)
+        /* 执行者离开（^D/exit 或掉线）：一律挂断当前前台作业（含 TUI）。
+         * 统一策略——不把半程程序/TUI 留给下一位执行者（dash_decision.md）。 */
+        if (s->running)
             kill_foreground_job(s);
         client_t *nxt = first_named_client(s, 0);
         if (nxt) {
@@ -485,8 +485,8 @@ static const char *sh_help_text =
     "\n"
     "快捷键（执行者）：\n"
     "  退格 / Ctrl+W / Ctrl+U  canonical 行编辑\n"
-    "  Ctrl+C               中断前台命令（人留在会话；仅执行者生效）\n"
-    "  Ctrl+D               离开会话（不影响前后台作业；所有用户可用）\n"
+    "  Ctrl+C               中断前台命令（TUI/raw 前台则作为按键送出；仅执行者）\n"
+    "  Ctrl+D               离开会话，并挂断当前前台作业（所有用户可用）\n"
     "\n"
     "会话外：\n"
     "  shsh -l              列出所有会话\n"
@@ -692,7 +692,6 @@ static void on_cmd_input(session_t *s)
 
 static void request_leave(session_t *s, client_t *c)
 {
-    c->clean_leave = true;
     msg_t bye;
     msg_make_bye(&bye, "已退出会话");
     send_msg(s, c, &bye, false);
@@ -721,9 +720,16 @@ static void handle_raw(session_t *s, client_t *c, const msg_t *m)
             break;
         }
         if (ch == 0x03) {
-            /* ^C：仅执行者在命令运行中中断前台组，人留下；其余忽略 */
-            if (c->id == s->executor_id && s->running && shsh_fg_pgid > 0)
-                kill(-shsh_fg_pgid, SIGINT);
+            /* ^C：仅执行者、命令运行中才生效，人留下。按前台是否处于 raw
+             * 决定语义（同真实终端）——raw/TUI 把 ^C 作为按键写入 pty 交给
+             * 前台程序；常规前台则对整组 SIGINT。 */
+            if (c->id == s->executor_id && s->running && shsh_fg_pgid > 0) {
+                struct termios t;
+                if (tcgetattr(s->pty_slave, &t) == 0 && !(t.c_lflag & ICANON))
+                    buf_append_byte(&pass, ch);
+                else
+                    kill(-shsh_fg_pgid, SIGINT);
+            }
             continue;
         }
         if (c->id == s->executor_id)
@@ -1126,6 +1132,11 @@ static int srv_cmd_wait(int fd)
     if (!s || fd != s->cmd_pipe[0])
         return -1;
     s->running = false;
+    /* 回到命令边界：把 pty 行规程复位回会话基线。前台 raw 程序/TUI 可能改
+     * 过 termios，且被杀（SIGHUP）时来不及自行复位；不复位会让下一次输入
+     * 无法 canonical 解析（换行不认、无回显），会话像"卡住"。 */
+    if (s->pty_tio_ok)
+        tcsetattr(s->pty_slave, TCSANOW, &s->pty_tio);
     /* 回到空闲：上一条命令已结束，携其状态收尾上一相位 */
     run_end(s, exitstatus);
     for (;;) {
