@@ -74,6 +74,14 @@ struct session {
     uint32_t next_id;
     uint32_t executor_id;
     bool stopping;
+    /* 提示符 sentinel（SOH/STX，见 §3.6）：master 输出流中剥离并缓存提示符串，
+     * 供新加入者单播（§3.5）。跨读可能被截断，故 states 常驻。 */
+    bool in_ps;             /* 已见 SOH、未见 STX */
+    char ps_buf[512];
+    size_t ps_len;
+    bool ps_ok;             /* 已有可单播的提示符缓存 */
+    char ps_cache[512];
+    size_t ps_cache_len;
     /* 空闲态从 pty slave 读到的 canonical 行缓冲（可能一次读到多行） */
     char cmd_buf[4096];
     size_t cmd_len;
@@ -232,10 +240,36 @@ static const char *executor_name(session_t *s)
     return c ? c->name : SHSHD_NAME;
 }
 
+/* 当前工作目录基名。cwd 由 shell 层维护（dash cd 即 chdir 本进程），
+ * 会话层直接用 getcwd 读取。 */
+static void cwd_basename(char *out, size_t sz)
+{
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) {
+        snprintf(out, sz, "?");
+        return;
+    }
+    const char *b = strrchr(cwd, '/');
+    const char *src = b ? (b[1] ? b + 1 : "/") : cwd;
+    snprintf(out, sz, "%s", src);
+}
+
+/* 合成执行者提示符（"<name>:<cwd>$ "）。仅在运行态发生执行权变更时使用：
+ * shell 正忙于前台作业、不会立刻打印 PS1，会话层先广播一枚带新执行者名的
+ * 提示符让移交可见；空闲时则改由注入 SHSH_USER 让 shell 自己打印。 */
+static void compose_prompt(session_t *s, char *out, size_t sz)
+{
+    char w[300];
+    cwd_basename(w, sizeof w);
+    snprintf(out, sz, "%s:%s$ ", executor_name(s), w);
+}
+
 /* shshd 执行 to：唯一的系统广播。显示为新行上的 shshd 命令行 */
 static void sys_to_line(session_t *s, const char *target)
 {
-    out_text(s, "\n%s$ to %s\n", SHSHD_NAME, target);
+    char w[300];
+    cwd_basename(w, sizeof w);
+    out_text(s, "\n%s:%s$ to %s\n", SHSHD_NAME, w, target);
 }
 
 static void broadcast_role(session_t *s)
@@ -362,6 +396,41 @@ static void emit_out(session_t *s, const uint8_t *p, size_t n)
     buf_free(&m.payload);
 }
 
+/* 过滤一段 master 输出：剥离提示符 sentinel（SOH=0x01/STX=0x02，终端不可见
+ * 且 dash 原样输出），并把提示符串缓存下来供新加入者单播（§3.5/3.6）。
+ * 其余字节顺序不变地广播出去。跨读的半个提示符由常驻的 in_ps 状态承接。 */
+static void pty_emit(session_t *s, const uint8_t *p, size_t n)
+{
+    uint8_t out[65536];
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t ch = p[i];
+        if (ch == 0x01) { /* SOH：提示符起始 */
+            s->in_ps = true;
+            s->ps_len = 0;
+            continue;
+        }
+        if (ch == 0x02) { /* STX：提示符结束，落缓存 */
+            if (s->in_ps) {
+                memcpy(s->ps_cache, s->ps_buf,
+                       s->ps_len < sizeof s->ps_cache ? s->ps_len
+                                                      : sizeof s->ps_cache);
+                s->ps_cache_len = s->ps_len < sizeof s->ps_cache
+                                      ? s->ps_len
+                                      : sizeof s->ps_cache;
+                s->ps_ok = true;
+                s->in_ps = false;
+            }
+            continue;
+        }
+        if (s->in_ps && s->ps_len < sizeof s->ps_buf)
+            s->ps_buf[s->ps_len++] = (char)ch;
+        out[o++] = ch;
+    }
+    if (o)
+        emit_out(s, out, o);
+}
+
 /* pty master 侧读：行规程回显、shell 层输出、前台命令输出都从这里广播 */
 static void pty_read_all(session_t *s)
 {
@@ -369,7 +438,7 @@ static void pty_read_all(session_t *s)
     for (;;) {
         ssize_t n = read(s->pty_master, buf, sizeof buf);
         if (n > 0) {
-            emit_out(s, buf, (size_t)n);
+            pty_emit(s, buf, (size_t)n);
             continue;
         }
         break; /* EAGAIN / EIO / EINTR */
@@ -496,6 +565,11 @@ static void inject_line(session_t *s, const char *line)
 static void update_user(session_t *s)
 {
     if (s->running) {
+        /* 运行态：shell 不会立刻打印 PS1，先广播合成的提示符让移交可见；
+         * 并记脏——空闲时注入 SHSH_USER 校正 shell 变量与后续真实 PS1 */
+        char ps1[512];
+        compose_prompt(s, ps1, sizeof ps1);
+        out_text(s, "%s", ps1);
         s->user_dirty = true;
         return;
     }
@@ -700,8 +774,15 @@ static void handle_hello(session_t *s, client_t *c, const msg_t *m)
     buf_free(&w.payload);
     broadcast_role(s);
 
-    if (took_over)
+    if (took_over) {
         update_user(s); /* 让 shell 打出带新执行者名的提示符 */
+    } else if (s->ps_ok && !s->running) {
+        /* 跟随者：单播缓存的当前提示符（§3.5 零历史），不广播、不惊动 shell */
+        msg_t pm;
+        msg_make_out(&pm, s->ps_cache, s->ps_cache_len);
+        send_msg(s, c, &pm, false);
+        buf_free(&pm.payload);
+    }
 }
 
 static void handle_list(session_t *s, client_t *c)
@@ -1062,6 +1143,7 @@ void session_free(session_t *s)
         shsh_cmd_wait = NULL;
         shsh_job_wait = NULL;
     }
+    flush_all(s); /* 关停前把排队的 BYE 送出（运行循环已不再负责 flush） */
     while (s->clients)
         client_disconnect(s, s->clients, false);
     kill_foreground_job(s);

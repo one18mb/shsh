@@ -699,6 +699,8 @@ def test_list_users():
 
 
 def test_shutdown_bye():
+    """shshd 关停由 SIGTERM 触发（SIGINT 归 shell 层作中断合成，不关停，
+    见 dash_decision.md 3.1）：广播 BYE、退出、清理 socket。"""
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -708,7 +710,7 @@ def test_shutdown_bye():
         bob = join("work", "bob")
         bob.assert_contains(ps1("alice"))
 
-        d.kill(signal.SIGINT)
+        d.kill(signal.SIGTERM)
         assert d.wait() == 0
         assert alice.wait() == 0
         alice.assert_contains("会话已结束")
@@ -772,7 +774,7 @@ def test_shell_state_persists():
 
 
 def test_shell_capabilities():
-    """自研最小 shell：内建 / 外部命令 / 引号 / 变量展开 / $? """
+    """shell 解释层（dash）：内建 / 外部命令 / 引号 / 变量展开 / $? """
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -804,8 +806,8 @@ def test_shell_capabilities():
         submit(alice, "alice", "echo status=$?", bob, "status=1\r\n")
         submit(alice, "alice", "echo st2=$?", bob, "st2=0\r\n")
 
-        # 不存在的外部命令
-        submit(alice, "alice", "no-such-cmd-xyz", bob, "无法执行")
+        # 不存在的外部命令（dash 层的 not found 报错）
+        submit(alice, "alice", "no-such-cmd-xyz", bob, "not found")
     finally:
         kill_all([d, alice, bob])
         clear_sockdir()
@@ -945,20 +947,12 @@ def test_help_builtin():
 
         alice.send("help\r")
         for want in ("shsh — 多用户共享 shell", "会话内建命令",
-                     "to <用户>", "执行权", "快捷键",
-                     "会话外", "当前 shell 不支持"):
+                     "to <用户>", "执行权", "快捷键", "会话外"):
             alice.assert_contains(want, timeout=5)
 
-        # help 是输出型内建：可重定向
-        alice.send("help > /tmp/shsh_help.txt\r")
-        time.sleep(0.4)
-        alice.send("grep -q 会话内建 /tmp/shsh_help.txt; echo rc=$?\r")
-        alice.assert_contains("rc=0")
-        os.unlink("/tmp/shsh_help.txt")
-
-        # help 经管道也正常（内建在子进程中执行）
-        alice.send("help | grep -q 快捷键; echo rc=$?\r")
-        alice.assert_contains("rc=0")
+        # help 是会话层拦截的会话内命令（不经 shell 解释执行），
+        # 故不可重定向/管道；执行后 shell 回到提示符。
+        alice.assert_contains(ps1("alice") + "help")
     finally:
         kill_all([d])
         if alice:
