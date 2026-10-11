@@ -43,6 +43,12 @@ int *shsh_errno;
 /* evalstring 在 eval.c（dash 原生）：setinputstring + parsecmd + evaltree */
 int evalstring(char *s, int flags);
 
+/* shsh 提示符（见 dash_decision.md 3.2/3.6）：执行者名 + cwd 基名。dash 经
+ * expandstr 做参数展开，用 PWD 的目录基名表达式（cwd 由 dash 自己维护，
+ * 会话层无需跟踪）；首尾 SOH/STX 不可见 sentinel 供会话层在 master 输出流
+ * 中识别提示符边界（空闲检测与提示符缓存）。 */
+#define SHSH_PS1 "\001$SHSH_USER:${PWD##*/}$ \002"
+
 static int sh_line_exc;
 
 /* 异常落点：fork 出的命令子进程继承/被重置到 main_handler，其 EV_EXIT
@@ -86,6 +92,9 @@ shsh_shell_init(void)
 	shellparam.optind = 1;
 	shellparam.optoff = 0;
 	shellparam.malloc = 0;
+
+	/* 固定 PS1 为 shsh 形态；dash 随后每次打印它即提示符。 */
+	setvar("PS1", SHSH_PS1, 0);
 }
 
 /* 执行一条 canonical 行（不含结尾换行）。
@@ -167,7 +176,9 @@ shsh_shell_run_fd(int fd, int *want_exit)
 			continue;			/* 本行出错，继续读下一条 */
 		}
 
-		n = parsecmd(0);			/* doprompt=0：无 PS1/PS2 输出 */
+		/* doprompt=1：dash 在每条命令/续行前打印 PS1/PS2，经 master 广播；
+		 * 提示符串由会话层按 sentinel 识别（3.6）。 */
+		n = parsecmd(1);
 		if (n == NEOF)
 			break;
 		status = evaltree(n, 0);
