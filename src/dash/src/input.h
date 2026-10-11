@@ -101,6 +101,12 @@ void pungetc(void);
 void pushstring(char *, void *);
 int setinputfile(const char *, int);
 void setinputstring(char *);
+#ifdef SHSH_EMBED
+/* shsh 会话命令源：把一个 fd 压为输入层（parser 从它阻塞读取，
+ * 未闭合引号/heredoc 跨行时自然等待后续写入）。会话层用 pipe 承载
+ * canonical 行。命名沿用 dash 的 setinputfd。 */
+void shsh_setinputfd(int fd, int push);
+#endif
 void popfile(void);
 void unwindfiles(struct parsefile *);
 void popallfiles(void);

@@ -770,8 +770,15 @@ makejob(union node *node, int nprocs)
 	}
 	memset(jp, 0, sizeof(*jp));
 #if JOBS
+#ifdef SHSH_EMBED
+	/* shsh：pipeline 与外部命令无条件独立成进程组（便于整组 ^C/HUP），
+	 * 但不接管终端（forkchild/waitforjob 中不做 tcsetpgrp）。
+	 * FORK_NOJOB（命令替换、heredoc）在 forkchild 里仍不成组。 */
+	jp->jobctl = 1;
+#else
 	if (jobctl)
 		jp->jobctl = 1;
+#endif
 #endif
 	jp->prev_job = curjob;
 	curjob = jp;
@@ -875,10 +882,14 @@ static void forkchild(struct job *jp, union node *n, int mode)
 			pgrp = getpid();
 		else
 			pgrp = jp->ps[0].pid;
-		/* This can fail because we are doing it in the parent also */
+		/* This can fail because we are doing it in the child also */
 		(void)setpgid(0, pgrp);
+#ifndef SHSH_EMBED
+		/* shsh 不接管终端：终端归会话层（pty），shell 不做前台组切换。
+		 * TSTP/TTOU 仍恢复默认，使后台组写 tty 时能被 TOSTOP 停止。 */
 		if (mode == FORK_FG)
 			xtcsetpgrp(ttyfd, pgrp);
+#endif
 		setsignal(SIGTSTP);
 		setsignal(SIGTTOU);
 	} else
@@ -1018,6 +1029,7 @@ waitforjob(struct job *jp)
 	st = getstatus(jp);
 #if JOBS
 	if (jp->jobctl) {
+#ifndef SHSH_EMBED
 		xtcsetpgrp(ttyfd, rootpid);
 		/*
 		 * This is truly gross.
@@ -1027,6 +1039,9 @@ waitforjob(struct job *jp)
 		 * intuit from the subprocess exit status whether a SIGINT
 		 * occurred, and if so interrupt ourselves.  Yuck.  - mycroft
 		 */
+#endif
+		/* shsh：shell 始终持有终端、从不 tcsetpgrp；但 ^C 由会话层
+		 * kill 前台组，子进程 SIGINT 退出后仍据此合成 EXINT 回提示符。 */
 		if (jp->sigint)
 			raise(SIGINT);
 	}

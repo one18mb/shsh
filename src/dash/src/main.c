@@ -64,8 +64,10 @@
 
 int rootpid;
 int shlvl;
+#ifndef SHSH_EMBED
 #ifdef __GLIBC__
 int *shsh_errno;
+#endif
 #endif
 #if PROFILE
 short profile_buf[16384];
@@ -76,16 +78,19 @@ MKINIT struct jmploc main_handler;
 STATIC void read_profile(const char *);
 STATIC char *find_dot_file(char *);
 static int cmdloop(int);
+#ifndef SHSH_EMBED
 int main(int, char **);
+#endif
 
 /*
  * Main routine.  We initialize things, parse the arguments, execute
- * profiles if we're a login shell, and then call cmdloop to execute
+ * profiles if it's a login shell, and then call cmdloop to execute
  * commands.  The setjmp call sets up the location to jump to when an
  * exception occurs.  When an exception occurs the variable "state"
  * is used to figure out how far we had gotten.
  */
 
+#ifndef SHSH_EMBED
 int
 main(int argc, char **argv)
 {
@@ -187,6 +192,7 @@ state4:	/* XXX ??? - why isn't this before the "if" statement */
 	exitshell();
 	/* NOTREACHED */
 }
+#endif /* !SHSH_EMBED */
 
 
 /*

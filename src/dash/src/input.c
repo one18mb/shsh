@@ -432,6 +432,14 @@ setinputfd(int fd, int push)
 	plinno = 1;
 }
 
+#ifdef SHSH_EMBED
+void
+shsh_setinputfd(int fd, int push)
+{
+	setinputfd(fd, push);
+}
+#endif
+
 
 /*
  * Like setinputfile, but takes input from a string.
