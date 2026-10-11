@@ -213,9 +213,14 @@ class TtyClient:
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0))
+        # 取 pty slave 为控制终端（新会话 + TIOCSCTTY），使 ISIG 生效：
+        # 非执行者本地 ^C 才能由系统向其进程组投递 SIGINT（真实终端语义）
+        def _ctty():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         self.p = subprocess.Popen(
             [bin_path("shsh"), "-s", session, "-n", name],
-            stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+            stdin=slave, stdout=slave, stderr=slave, preexec_fn=_ctty)
         os.close(slave)
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -737,6 +742,42 @@ def test_follower_ctrl_keys_leave():
         assert bob.wait() == 0, "follower ^C 应结束客户端"
     finally:
         kill_all([d, alice, bob])
+        clear_sockdir()
+
+
+def test_follower_exits_when_shshd_stuck():
+    """shshd 无响应（纯内建死循环，从不回调会话层）时，follower 仍能本地退出"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = carol = None
+    try:
+        alice = TtyClient("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        # 两个 follower 先加入（此刻 shshd 尚响应）
+        bob = TtyClient("work", "bob")
+        bob.assert_contains(ps1("alice"))
+        carol = TtyClient("work", "carol")
+        carol.assert_contains(ps1("alice"))
+        time.sleep(0.3)
+
+        # 纯内建死循环：shell 不再回到 hook，shshd 不再响应任何请求
+        alice.send("while true; do :; done\r")
+        time.sleep(0.6)
+
+        # follower 本地 ^D / ^C：等不到 BYE 也能退出
+        bob.send("\x04")
+        carol.send("\x03")
+        deadline = time.time() + 3
+        while time.time() < deadline and (
+                bob.p.poll() is None or carol.p.poll() is None):
+            time.sleep(0.05)
+        assert bob.p.poll() is not None, "shshd 卡死时 follower ^D 也应退出"
+        assert carol.p.poll() is not None, "shshd 卡死时 follower ^C 也应退出"
+    finally:
+        for p in (alice, bob, carol):
+            if p:
+                p.kill()
+        kill_all([d])
         clear_sockdir()
 
 

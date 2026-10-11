@@ -27,10 +27,48 @@ static struct termios g_saved;
 static bool g_saved_ok;
 static bool g_tty;
 
+/* 角色：自身 id 与当前执行者 id（来自 WELCOME/ROLE），决定本地终端模式 */
+static uint32_t g_self_id;
+static uint32_t g_exec_id;
+static bool g_have_role;
+
+static bool is_follower(void)
+{
+    return g_have_role && g_exec_id != g_self_id;
+}
+
 static void restore_tio(void)
 {
     if (g_saved_ok && g_tty)
         tcsetattr(STDIN_FILENO, TCSADRAIN, &g_saved);
+}
+
+/* 按角色设置本地终端：
+ *  - 执行者：raw（^C/^D 作为字节上送，交 shshd 按相位裁决）
+ *  - follower：cooked 去回显——保留 ISIG/ICANON，让本地系统处理 ^C(SIGINT)
+ *    与 ^D(EOF)，因此 **shshd 无响应时也能正常退出**；仅关回显保持输入静默。 */
+static void apply_stdio_mode(bool follower)
+{
+    if (!g_tty || !g_saved_ok)
+        return;
+    struct termios t = g_saved;
+    if (follower) {
+        t.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHOCTL);
+        t.c_lflag |= ICANON | ISIG;
+        t.c_oflag |= (OPOST | ONLCR);
+    } else {
+        cfmakeraw(&t);
+        t.c_oflag |= (OPOST | ONLCR);
+    }
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &t);
+}
+
+/* SIGINT/SIGTERM/SIGHUP：恢复终端后退出（真实 handler，即使主循环卡住也生效） */
+static void on_signal(int sig)
+{
+    (void)sig;
+    restore_tio();
+    _exit(0);
 }
 
 static int write_all(int fd, const void *p, size_t n)
@@ -105,9 +143,10 @@ static void send_raw(int fd, const void *p, size_t n)
     buf_free(&m.payload);
 }
 
-/* 转发一批 stdin 字节：普通字节成批上送；^C/^D 各自单独成帧。语义完全由
- * 服务端裁决（客户端是哑管道：^C/^D 不再本地退出）——执行者的 ^C/^D 可能
- * 被转交给其前台任务，follower 的则按 shsh 自身处理（离开）。 */
+/* 转发一批 stdin 字节：普通字节成批上送；^C/^D 各自单独成帧。
+ *  - 执行者：^C/^D 一律上送，由 shshd 按相位裁决（运行态可能转交前台任务）
+ *  - follower：其前台即 shsh 自身——^C/^D 直接本地结束客户端，不等 BYE
+ *    （tty 场景下系统已先行处理，此处是无 tty 时的兜底） */
 static void forward_input(int sock, const uint8_t *p, size_t n)
 {
     size_t i = 0;
@@ -120,6 +159,10 @@ static void forward_input(int sock, const uint8_t *p, size_t n)
         if (i == n)
             break;
         uint8_t ctl = p[i++];
+        if (is_follower()) {
+            restore_tio();
+            _exit(0);
+        }
         send_raw(sock, &ctl, 1);
     }
 }
@@ -145,11 +188,8 @@ int client_join(const char *session, const char *name)
     if (g_tty && tcgetattr(STDIN_FILENO, &g_saved) == 0) {
         g_saved_ok = true;
         atexit(restore_tio);
-        /* 全程原始模式（任何角色、任何相位）；保留输出后处理，避免阶梯显示 */
-        struct termios t = g_saved;
-        cfmakeraw(&t);
-        t.c_oflag |= (OPOST | ONLCR);
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &t);
+        /* 未知角色前先 raw；收到 WELCOME/ROLE 后按角色重设 */
+        apply_stdio_mode(false);
     }
 
     struct winsize ws;
@@ -168,11 +208,19 @@ int client_join(const char *session, const char *name)
         return 1;
     }
 
+    /* ^C/^D 语义由本地终端模式决定（见 apply_stdio_mode）：SIGINT/SIGTERM/
+     * SIGHUP 用真实 handler（跟随者 ^C 由系统发 SIGINT、外部 kill 亦然），
+     * 即使主循环卡住也能恢复终端并退出；SIGWINCH 走 signalfd 以便读尺寸。 */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+
     sigset_t mask;
     sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGWINCH);
     sigprocmask(SIG_BLOCK, &mask, NULL);
     int sigfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
@@ -216,20 +264,14 @@ int client_join(const char *session, const char *name)
         if (pfds[1].revents & POLLIN) {
             struct signalfd_siginfo si;
             while (read(sigfd, &si, sizeof si) == sizeof si) {
-                if (si.ssi_signo == SIGWINCH) {
-                    if (g_tty && welcome) {
-                        struct winsize nw;
-                        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &nw) == 0) {
-                            msg_t wm;
-                            msg_make_winch(&wm, nw.ws_row, nw.ws_col);
-                            send_frame(fd, &wm);
-                            buf_free(&wm.payload);
-                        }
+                if (si.ssi_signo == SIGWINCH && g_tty && welcome) {
+                    struct winsize nw;
+                    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &nw) == 0) {
+                        msg_t wm;
+                        msg_make_winch(&wm, nw.ws_row, nw.ws_col);
+                        send_frame(fd, &wm);
+                        buf_free(&wm.payload);
                     }
-                } else {
-                    /* 外部信号（kill）：按掉线离开，不由 ^C/^D 路径处理 */
-                    quit = true;
-                    rc = 0;
                 }
             }
         }
@@ -238,7 +280,12 @@ int client_join(const char *session, const char *name)
             uint8_t chunk[4096];
             ssize_t n = read(STDIN_FILENO, chunk, sizeof chunk);
             if (n == 0) {
-                /* stdin EOF：发一个 ^D 后停止监听 stdin，自身不退出——
+                if (is_follower()) {
+                    /* follower 无 tty 兜底：EOF 视同 ^D，本地退出 */
+                    restore_tio();
+                    _exit(0);
+                }
+                /* 执行者 stdin EOF：发一个 ^D 后停止监听 stdin，自身不退出——
                  * 是否离开由服务端裁决（运行态会把它交给前台任务） */
                 uint8_t eot = 0x04;
                 send_raw(fd, &eot, 1);
@@ -272,9 +319,27 @@ int client_join(const char *session, const char *name)
                 const uint8_t *data = NULL;
                 size_t len = 0;
                 switch (m.type) {
-                case S2C_WELCOME:
+                case S2C_WELCOME: {
+                    uint32_t sid = 0, eid = 0;
+                    char en[SH_NAME_MAX + 1];
+                    if (msg_parse_welcome(&m, &sid, &eid, en, sizeof en) == 0) {
+                        g_self_id = sid;
+                        g_exec_id = eid;
+                        g_have_role = true;
+                        apply_stdio_mode(is_follower());
+                    }
                     welcome = true;
                     break;
+                }
+                case S2C_ROLE: {
+                    uint32_t eid = 0;
+                    if (msg_parse_role(&m, &eid) == 0) {
+                        g_exec_id = eid;
+                        g_have_role = true;
+                        apply_stdio_mode(is_follower());
+                    }
+                    break;
+                }
                 case S2C_OUT:
                     msg_parse_bytes(&m, &data, &len);
                     if (len)
@@ -295,8 +360,7 @@ int client_join(const char *session, const char *name)
                     }
                     break;
                 }
-                /* RUN_BEGIN/RUN_END/ROLE/NOTICE/LISTRESP：
-                 * 终端模式不再随相位切换，无需客户端动作 */
+                /* RUN_BEGIN/RUN_END/NOTICE/LISTRESP：无需客户端动作 */
                 default:
                     break;
                 }
