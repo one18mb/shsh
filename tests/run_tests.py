@@ -781,6 +781,39 @@ def test_follower_exits_when_shshd_stuck():
         clear_sockdir()
 
 
+def test_heredoc_abort_no_leak():
+    """heredoc(PS2) 续行中执行者 ^D 离开：半行不得被新执行者执行，
+    也不出现旧执行者名的过渡提示符"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        alice.send("cat - << EOF\n")     # 进入 heredoc 续行
+        time.sleep(0.3)
+        bob = join("work", "bob")        # 在 PS2 期间加入（follower）
+        time.sleep(0.2)
+        alice.send("str")                # heredoc 体半行（无换行）
+        time.sleep(0.3)
+        alice.send(b"\x04")              # 执行者离开：放弃半成品
+        assert alice.wait() == 0
+
+        bob.assert_contains(ps1("bob"), timeout=5)
+        time.sleep(0.4)
+        bob.send("\n")                   # 回车也不应把 str 带出来执行
+        time.sleep(0.4)
+        assert not bob.contains("not found"), \
+            "残留半行不应被执行: %r" % bob.text()
+        assert not bob.contains(ps1("alice")), \
+            "不应出现旧执行者名的过渡提示符: %r" % bob.text()
+        bob.send("echo ok-after\n")
+        bob.assert_contains("ok-after\r\n", timeout=5)
+    finally:
+        kill_all([d, alice, bob])
+        clear_sockdir()
+
+
 def test_compound_command_aborted_on_drop():
     """执行者运行复合命令（for）时掉线：终止**整个**命令，不只当前 pipeline"""
     clear_sockdir()

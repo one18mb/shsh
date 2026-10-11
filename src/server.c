@@ -72,7 +72,6 @@ struct session {
     bool slave_armed;   /* pty slave 是否已注册进 epoll */
     bool running;       /* 前台命令执行中（两个钩子切换，供 ^C/相位判断） */
     bool phase_run;     /* 已发 RUN_BEGIN、尚未发 RUN_END（相位，见 §3.6） */
-    bool user_dirty;    /* 非 PS1 边界发生的执行权变更，待回 PS1 时注入 SHSH_USER */
     bool abort_cmd;     /* 需放弃未完成的多行命令（执行者中途离开，见 srv_cmd_wait） */
     client_t *clients;  /* 按连接顺序，头部 = 最早加入 */
     uint32_t next_id;
@@ -115,6 +114,24 @@ static int set_nonblock(int fd)
 static void set_sun_path(struct sockaddr_un *a, const char *path)
 {
     snprintf(a->sun_path, sizeof a->sun_path, "%s", path);
+}
+
+/* 丢弃当前执行者"未交付"的键入：pty 行规程里尚未成行的半行（如 heredoc/
+ * 续行中输入到一半的字节）与已注入命令管道、shell 尚未读走的字节，以及
+ * 会话层累加缓冲。执行者离开时调用——否则这些残留会被下一位执行者的
+ * 回车"补全"成命令执行（归属错乱）。 */
+static void discard_pending_input(session_t *s)
+{
+    if (s->pty_tio_ok)
+        tcflush(s->pty_slave, TCIFLUSH); /* 仅清输入半行，不丢已产生的输出 */
+    s->cmd_len = 0;
+    struct pollfd p = {.fd = s->cmd_pipe[0], .events = POLLIN};
+    char buf[256];
+    while (s->cmd_pipe[0] >= 0 && poll(&p, 1, 0) == 1 &&
+           (p.revents & POLLIN)) {
+        if (read(s->cmd_pipe[0], buf, sizeof buf) <= 0)
+            break;
+    }
 }
 
 static client_t *client_find(session_t *s, int fd)
@@ -356,9 +373,14 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
          * （for/while）要继续下一轮、多行未完成（PS2）要被补完，都不允许。 */
         if (s->running)
             kill_foreground_job(s);
+        /* 丢弃离开者未交付的键入，别让它被下一位执行者"补全"执行 */
+        discard_pending_input(s);
         if (s->running || whichprompt == 2)
             s->abort_cmd = true;
         client_t *nxt = first_named_client(s, 0);
+        /* 立即更新 shell 的 SHSH_USER：之后（含 abort 后）shell 打出的 PS1
+         * 就直接是新执行者名，不再有"旧名过渡提示符" */
+        shsh_shell_set_user(nxt ? nxt->name : SHSHD_NAME);
         if (nxt) {
             s->executor_id = nxt->id;
             sys_to_line(s, nxt->name);
@@ -568,28 +590,23 @@ static void inject_line(session_t *s, const char *line)
     }
 }
 
-/* 执行权变更后刷新提示符：空闲时直接注入 SHSH_USER 赋值（shell 随后的
- * 提示符即带新执行者名）；运行态先记脏，待下一次空闲再注入。 */
+/* 执行权变更后刷新提示符：直接改 shell 变量（SHSH_USER），并按相位让提示符
+ * 尽快出现——运行态广播合成提示符，空闲注入空行触发重打，PS2 交给 abort。 */
 static void update_user(session_t *s)
 {
+    /* shell 变量即时更新（不经命令源）：此后任何一次提示符打印都带新名字，
+     * 不会再出现"先按旧名打一次 PS1 再改名"的过渡提示符 */
+    shsh_shell_set_user(executor_name(s));
     if (s->running) {
-        /* 运行态：shell 不会立刻打印 PS1，先广播合成的提示符让移交可见；
-         * 并记脏——回到 PS1 时注入 SHSH_USER 校正 shell 变量与后续真实 PS1 */
+        /* 运行态：shell 不会立刻打印 PS1，先广播合成提示符让移交可见 */
         char ps1[512];
         compose_prompt(s, ps1, sizeof ps1);
         out_text(s, "%s", ps1);
-        s->user_dirty = true;
-        return;
+    } else if (whichprompt == 1) {
+        /* 空闲：注入一个空行让 shell 重打提示符（此刻不会污染任何命令） */
+        inject_line(s, "\n");
     }
-    if (whichprompt != 1) {
-        /* 多行命令续行（PS2）中：此刻注入赋值会被当作该命令的一部分执行，
-         * 污染未完成命令并错误改变其归属；延迟到回到 PS1 边界再注入 */
-        s->user_dirty = true;
-        return;
-    }
-    char line[SH_NAME_MAX + 16];
-    snprintf(line, sizeof line, "SHSH_USER=%s\n", executor_name(s));
-    inject_line(s, line);
+    /* PS2 续行：变量已更新，待 abort/回 PS1 后 shell 自会以新名打印，不注入 */
 }
 
 static bool line_token(const char *line, const char *tok, const char **rest)
@@ -812,8 +829,9 @@ static void handle_hello(session_t *s, client_t *c, const msg_t *m)
 
     if (took_over) {
         update_user(s); /* 让 shell 打出带新执行者名的提示符 */
-    } else if (s->ps_ok && !s->running) {
-        /* 跟随者：单播缓存的当前提示符（§3.5 零历史），不广播、不惊动 shell */
+    } else if (s->ps_ok && !s->running && whichprompt == 1) {
+        /* 跟随者：单播缓存的当前提示符（§3.5 零历史），不广播、不惊动 shell。
+         * PS2 续行中缓存的是"上一次 PS1"，并非当前相位，故不单播 */
         msg_t pm;
         msg_make_out(&pm, s->ps_cache, s->ps_cache_len);
         send_msg(s, c, &pm, false);
@@ -1158,10 +1176,6 @@ static int srv_cmd_wait(int fd)
              * 运行态（复合命令）的情形在 srv_job_wait 处理。 */
             s->abort_cmd = false;
             shsh_shell_abort();
-        }
-        if (s->user_dirty && whichprompt == 1) {
-            s->user_dirty = false;
-            update_user(s);
         }
         if (deliver_lines(s))
             return 0;

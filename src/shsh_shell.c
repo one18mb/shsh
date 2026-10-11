@@ -148,6 +148,13 @@ shsh_shell_abort(void)
 	onint();			/* 声明为 noreturn：exraise(EXINT) */
 }
 
+/* 直接设置 SHSH_USER（见 shsh_shell.h）。setvar 会复制、导出该变量。 */
+void
+shsh_shell_set_user(const char *name)
+{
+	setvar("SHSH_USER", name, VEXPORT);
+}
+
 /* 从持久 fd 源驱动：无提示符版 cmdloop。EOF（NEOF）结束本次驱动但不
  * exitshell——会话命令 pipe 的 EOF 只在 shshd 关停时出现。每条命令的
  * 解析/执行异常仍经 main_handler：子进程 exitshell，根 shell reset

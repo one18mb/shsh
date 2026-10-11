@@ -13,6 +13,11 @@ int shsh_shell_run_line(const char *line, int *want_exit);
  * 仅在 shell 处于 PS2（whichprompt==2）且可 longjmp 的上下文中调用。 */
 void shsh_shell_abort(void);
 
+/* 直接设置 shell 的 SHSH_USER 变量（当前执行者名）。执行权变更时由会话层
+ * 立即调用，使 shell 随后打印的 PS1 就带新名字——避免"先按旧名打一次 PS1、
+ * 再注入改名"产生的过渡提示符。 */
+void shsh_shell_set_user(const char *name);
+
 /* 把一个已打开的命令源 fd（通常是会话 pipe 的读端，调用方应放到 >=10
  * 以免与 shell 内部 fd 冲突）压为持久输入层，并驱动解析执行直到该 fd
  * EOF。未闭合引号/heredoc/行尾续行期间 parser 阻塞在 fd 上等后续写入，
