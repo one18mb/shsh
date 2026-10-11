@@ -45,3 +45,18 @@ int pty_set_size(int fd, uint16_t rows, uint16_t cols)
     ws.ws_ypixel = 0;
     return ioctl(fd, TIOCSWINSZ, &ws);
 }
+
+int pty_config_shared(int slave_fd, struct termios *canon)
+{
+    struct termios t;
+    if (tcgetattr(slave_fd, &t) != 0)
+        return -1;
+    t.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | TOSTOP;
+    t.c_lflag &= ~(ISIG);
+    t.c_iflag |= ICRNL;  /* 客户端 CR 交付为换行 */
+    if (tcsetattr(slave_fd, TCSANOW, &t) != 0)
+        return -1;
+    if (canon)
+        *canon = t;
+    return 0;
+}

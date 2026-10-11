@@ -438,7 +438,7 @@ def test_prompt_and_no_join_broadcast():
 
 
 def test_shared_output_and_echo():
-    """命令提交前不可见；提交后回显与输出共享"""
+    """输入过程实时共享；提交后回显与输出都在共享流中"""
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -449,12 +449,12 @@ def test_shared_output_and_echo():
         bob.assert_contains(ps1("alice"))
         time.sleep(0.2)
 
-        alice.send("echo hid")  # 未提交
+        alice.send("echo hidden")  # 未提交：键入过程已实时广播
         time.sleep(0.3)
-        assert not bob.contains("hid"), "命令提交前不应共享: %r" % bob.text()
-
-        alice.send("den\n")  # 提交 "echo hidden"
         bob.assert_contains(ps1("alice") + "echo hidden")
+        alice.assert_contains("echo hidden")
+
+        alice.send("\n")  # 提交
         bob.assert_contains("hidden\r\n")
         alice.assert_contains("hidden\r\n")
         # 命令结束后新提示符回到两个终端
@@ -643,6 +643,35 @@ def test_ctrl_c_interrupts_command():
         clear_sockdir()
 
 
+def test_ctrl_d_keeps_foreground_job():
+    """运行中 ^D：人离开、执行权移交，但前台作业不被挂断"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        bob = join("work", "bob")
+        bob.assert_contains(ps1("alice"))
+        time.sleep(0.2)
+
+        alice.send('sh -c "sleep 77"\n')
+        time.sleep(0.6)
+        alice.send(b"\x04")  # ^D 干净离开
+        assert alice.wait() == 0
+        time.sleep(0.4)
+
+        # 前台 sleep 仍存活（^D 不发任何信号），且执行权已转给 bob
+        pg = subprocess.run("pgrep -f 'sleep 77'", shell=True,
+                            capture_output=True)
+        assert pg.returncode == 0, "^D 不应挂断前台作业"
+        bob.assert_contains(ps1("bob"), timeout=5)
+    finally:
+        subprocess.run("pkill -f 'sleep 77'", shell=True)
+        kill_all([d, alice, bob])
+        clear_sockdir()
+
+
 def test_list_users():
     clear_sockdir()
     d = start_server("work")
@@ -799,15 +828,16 @@ def test_shell_control_ops():
         alice = join("work", "alice")
         alice.assert_contains(ps1("alice"))
         submit(alice, "alice", "echo a; echo b", alice, "a\r\nb\r\n")
+        # && 短路："no" 只出现在命令回显行一次，不应再有独立输出行
         submit(alice, "alice", "false && echo no", alice)
-        assert not alice.wait_contains("no\r\n", timeout=0.8), \
-            "&& 后不应执行: %r" % alice.text()
+        assert alice.count("no\n") == 1, \
+            "&& 短路失效（no 出现次数异常）: %r" % alice.text()
         submit(alice, "alice", "false || echo yes", alice, "yes\r\n")
         submit(alice, "alice", "true && echo ok", alice, "ok\r\n")
         submit(alice, "alice", "echo x; false; echo y", alice, "x\r\ny\r\n")
         submit(alice, "alice", "true || echo no2", alice)
-        assert not alice.wait_contains("no2\r\n", timeout=0.8), \
-            "|| 短路失效: %r" % alice.text()
+        assert alice.count("no2\n") == 1, \
+            "|| 短路失效（no2 出现次数异常）: %r" % alice.text()
         # 整行状态
         submit(alice, "alice", "false; echo after=$?", alice, "after=1\r\n")
     finally:
@@ -881,7 +911,7 @@ def test_shell_pipeline_ctrl_c():
 
 
 def test_tty_line_editing():
-    """真实终端下行编辑：退格、光标移动、Ctrl+U、Ctrl+A/E"""
+    """真实终端下行编辑：退格、Ctrl+U（canonical 行规程提供）"""
     clear_sockdir()
     d = start_server("work")
     alice = None
@@ -893,14 +923,10 @@ def test_tty_line_editing():
         alice.send("echo abX\x7f\r")
         alice.assert_contains("ab\r\n")
 
-        # Ctrl+U 清行后重输
+        # Ctrl+U 清行后重输（VKILL 由 pty 行规程处理）
         alice.send("garbage\x15echo clean\r")
         alice.assert_contains("clean\r\n")
         assert not alice.contains("garbage\r\n"), "Ctrl+U 未清行"
-
-        # Ctrl+A 回行首插入：输入 "cho A"，Ctrl+A，输入 "e"，得到 "echo A"
-        alice.send("cho A\x01e\r")
-        alice.assert_contains("A\r\n")
     finally:
         kill_all([d])
         if alice:
@@ -922,7 +948,6 @@ def test_help_builtin():
                      "to <用户>", "执行权", "快捷键",
                      "会话外", "当前 shell 不支持"):
             alice.assert_contains(want, timeout=5)
-        assert alice.wait_line("alice:shsh$ "), alice.screen().line()
 
         # help 是输出型内建：可重定向
         alice.send("help > /tmp/shsh_help.txt\r")

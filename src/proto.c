@@ -119,12 +119,6 @@ void msg_make_hello(msg_t *m, const char *name, uint16_t rows, uint16_t cols)
     m->type = C2S_HELLO;
 }
 
-void msg_make_quit(msg_t *m)
-{
-    buf_init(&m->payload);
-    m->type = C2S_QUIT;
-}
-
 void msg_make_list(msg_t *m)
 {
     buf_init(&m->payload);
@@ -250,11 +244,6 @@ void msg_make_out(msg_t *m, const void *data, size_t len)
     make_bytes_msg(m, S2C_OUT, data, len);
 }
 
-void msg_make_cmd_echo(msg_t *m, const void *data, size_t len)
-{
-    make_bytes_msg(m, S2C_CMD_ECHO, data, len);
-}
-
 void msg_make_run_begin(msg_t *m)
 {
     make_bytes_msg(m, S2C_RUN_BEGIN, NULL, 0);
@@ -272,11 +261,6 @@ void msg_make_role(msg_t *m, uint32_t exec_id)
     buf_init(&m->payload);
     put_u32(&m->payload, exec_id);
     m->type = S2C_ROLE;
-}
-
-void msg_make_line(msg_t *m, const void *data, size_t len)
-{
-    make_bytes_msg(m, C2S_LINE, data, len);
 }
 
 void msg_make_raw(msg_t *m, const void *data, size_t len)

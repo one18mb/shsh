@@ -11,15 +11,12 @@
 enum {
     /* C -> S */
     C2S_HELLO = 1,
-    C2S_LINE,
-    C2S_RAW,
+    C2S_RAW,     /* 原始键入（含 0x03/0x04，语义由服务端解释） */
     C2S_WINCH,
-    C2S_QUIT,
     C2S_LIST,
     /* S -> C */
     S2C_WELCOME = 64,
     S2C_OUT,
-    S2C_CMD_ECHO,
     S2C_RUN_BEGIN,
     S2C_RUN_END,
     S2C_ROLE,
@@ -39,7 +36,6 @@ int msg_encode(const msg_t *m, buf_t *out); /* 追加到 out */
 int msg_try_extract(buf_t *in, msg_t *m);
 
 void msg_make_hello(msg_t *m, const char *name, uint16_t rows, uint16_t cols);
-void msg_make_quit(msg_t *m);
 void msg_make_list(msg_t *m);
 void msg_make_welcome(msg_t *m, uint32_t self_id, uint32_t exec_id,
                       const char *exec_name,
@@ -72,13 +68,11 @@ int msg_parse_text(const msg_t *m, char *text, size_t textsz);
 int msg_parse_listresp(const msg_t *m, char *session, size_t ssz,
                        user_info_t *users, size_t cap, size_t *n);
 
-/* M1：终端共享 */
+/* 终端共享 */
 void msg_make_out(msg_t *m, const void *data, size_t len);
-void msg_make_cmd_echo(msg_t *m, const void *data, size_t len);
 void msg_make_run_begin(msg_t *m);
 void msg_make_run_end(msg_t *m, int status);
 void msg_make_role(msg_t *m, uint32_t exec_id);
-void msg_make_line(msg_t *m, const void *data, size_t len);
 void msg_make_raw(msg_t *m, const void *data, size_t len);
 void msg_make_winch(msg_t *m, uint16_t rows, uint16_t cols);
 
