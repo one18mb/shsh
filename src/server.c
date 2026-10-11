@@ -39,6 +39,10 @@ extern void (*shsh_job_wait)(void);
 extern pid_t shsh_fg_pgid;
 /* 上一条命令的退出状态（dash 层 error.c 的 exitstatus）：RUN_END 携带 */
 extern int exitstatus;
+/* 最近一次提示符：1=PS1（新命令边界），2=PS2（多行命令续行，见 parser.h）。
+ * 会话层据此只在 PS1 拦截 to/exit/help、只在 PS1 注入 SHSH_USER，
+ * 避免把多行命令中路过的 exit/续行当作会话级指令处理。 */
+extern int whichprompt;
 
 typedef struct client {
     int fd;
@@ -69,7 +73,8 @@ struct session {
     bool slave_armed;   /* pty slave 是否已注册进 epoll */
     bool running;       /* 前台命令执行中（两个钩子切换，供 ^C/相位判断） */
     bool phase_run;     /* 已发 RUN_BEGIN、尚未发 RUN_END（相位，见 §3.6） */
-    bool user_dirty;    /* 运行态发生的执行权变更，待空闲时注入 SHSH_USER */
+    bool user_dirty;    /* 非 PS1 边界发生的执行权变更，待回 PS1 时注入 SHSH_USER */
+    bool abort_cmd;     /* 需放弃未完成的多行命令（执行者中途离开，见 srv_cmd_wait） */
     client_t *clients;  /* 按连接顺序，头部 = 最早加入 */
     uint32_t next_id;
     uint32_t executor_id;
@@ -361,6 +366,11 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
             broadcast_role(s);
             update_user(s);
         }
+        /* shell 停在未完成的多行命令（PS2）时，绝不把半成品交给新执行者
+         * 接手完成（否则命令归属被窃取）：标记放弃，回 shell 时经 EXINT
+         * 丢弃半成品解析并回到 PS1，新执行者从干净边界开始 */
+        if (!s->running && whichprompt == 2)
+            s->abort_cmd = true;
     }
     c->dead = true;
     buf_free(&c->in);
@@ -566,10 +576,16 @@ static void update_user(session_t *s)
 {
     if (s->running) {
         /* 运行态：shell 不会立刻打印 PS1，先广播合成的提示符让移交可见；
-         * 并记脏——空闲时注入 SHSH_USER 校正 shell 变量与后续真实 PS1 */
+         * 并记脏——回到 PS1 时注入 SHSH_USER 校正 shell 变量与后续真实 PS1 */
         char ps1[512];
         compose_prompt(s, ps1, sizeof ps1);
         out_text(s, "%s", ps1);
+        s->user_dirty = true;
+        return;
+    }
+    if (whichprompt != 1) {
+        /* 多行命令续行（PS2）中：此刻注入赋值会被当作该命令的一部分执行，
+         * 污染未完成命令并错误改变其归属；延迟到回到 PS1 边界再注入 */
         s->user_dirty = true;
         return;
     }
@@ -614,24 +630,28 @@ static bool deliver_lines(session_t *s)
         s->cmd_len -= consumed;
         memmove(s->cmd_buf, s->cmd_buf + consumed, s->cmd_len);
 
-        /* 行规程已回显整行；此处按行首词法精确匹配拦截 */
-        if (line_token(line, "exit", NULL)) {
-            client_t *c = client_by_id(s, s->executor_id);
-            if (c)
-                request_leave(s, c);
-            continue;
-        }
-        const char *rest = NULL;
-        if (line_token(line, "to", &rest)) {
-            client_t *c = client_by_id(s, s->executor_id);
-            if (c)
-                cmd_to(s, c, rest);
-            continue;
-        }
-        if (line_token(line, "help", NULL)) {
-            cmd_help(s);
-            inject_line(s, "\n"); /* 让 shell 回到 PS1 */
-            return true;
+        /* 仅在新命令边界（PS1）按行首词法拦截 to/exit/help。多行命令的
+         * 续行（PS2，如 if/heredoc 体）里出现的同名行属于该命令本身，必须
+         * 原样交给 shell——否则会被误判为会话级指令并导致执行权中途移交。 */
+        if (whichprompt == 1) {
+            if (line_token(line, "exit", NULL)) {
+                client_t *c = client_by_id(s, s->executor_id);
+                if (c)
+                    request_leave(s, c);
+                continue;
+            }
+            const char *rest = NULL;
+            if (line_token(line, "to", &rest)) {
+                client_t *c = client_by_id(s, s->executor_id);
+                if (c)
+                    cmd_to(s, c, rest);
+                continue;
+            }
+            if (line_token(line, "help", NULL)) {
+                cmd_help(s);
+                inject_line(s, "\n"); /* 让 shell 回到 PS1 */
+                return true;
+            }
         }
         /* 普通行（含空行）：交给 shell 解析执行 */
         run_begin(s);
@@ -1093,7 +1113,7 @@ static void session_drive(session_t *s, bool block)
                 }
             }
         }
-    } while (block && !s->stopping && !have_pending_cmd(s));
+    } while (block && !s->stopping && !s->abort_cmd && !have_pending_cmd(s));
 }
 
 /* ---- shell 层钩子 ---- */
@@ -1111,7 +1131,13 @@ static int srv_cmd_wait(int fd)
     for (;;) {
         if (s->stopping)
             return -1;
-        if (s->user_dirty) {
+        if (s->abort_cmd) {
+            /* 执行者中途离开、shell 停在未完成的多行命令：放弃半成品解析，
+             * 经 EXINT 回到 PS1（noreturn，不会返回到此处） */
+            s->abort_cmd = false;
+            shsh_shell_abort();
+        }
+        if (s->user_dirty && whichprompt == 1) {
             s->user_dirty = false;
             update_user(s);
         }

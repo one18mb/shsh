@@ -486,6 +486,48 @@ def test_follower_input_ignored():
         clear_sockdir()
 
 
+def test_multiline_exit_not_intercepted():
+    """多行命令续行（PS2）中的 exit 行属该命令本体，不应被会话层拦截"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        # if 分支为假：体内的 exit 不执行；关键是不被会话层当作离开指令
+        alice.send("if false; then\nexit\nfi\necho alive\n")
+        alice.assert_contains("alive\r\n", timeout=5)
+        time.sleep(0.3)
+        assert alice.p.poll() is None, "续行中的 exit 不应导致离开会话"
+    finally:
+        kill_all([d, alice])
+        clear_sockdir()
+
+
+def test_multiline_abandon_aborts():
+    """执行者停在多行命令中途离开：半成品被放弃，不交给新执行者完成"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        bob = join("work", "bob")
+        bob.assert_contains(ps1("alice"))
+
+        alice.send("if true; then\n")   # 停在 PS2 续行
+        alice.assert_contains("> ")
+        alice.kill()                    # 掉线离开（非 ^D）
+        # 执行权移交 bob 且回到 PS1（半成品 if 已被放弃）
+        bob.assert_contains(ps1("bob"), timeout=5)
+        bob.send("echo standalone\n")
+        # 命令独立执行（若被并入未完成的 if，则不会有输出）
+        bob.assert_contains("standalone\r\n", timeout=5)
+    finally:
+        kill_all([d, alice, bob])
+        clear_sockdir()
+
+
 def test_to_builtin():
     """to <name>：显式转交（命令由本人发出，显示为本人命令行）"""
     clear_sockdir()

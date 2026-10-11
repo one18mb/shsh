@@ -137,6 +137,17 @@ shsh_shell_run_line(const char *line, int *want_exit)
 	return status;
 }
 
+/* 放弃当前未完成的多行命令输入：复用 dash 的中断恢复路径（onint →
+ * EXINT → 回到 run_fd 的 main_handler 落点并 reset），丢弃半成品解析。
+ * 由会话层在执行者中途离开（shell 停在 PS2）时调用。 */
+void
+shsh_shell_abort(void)
+{
+	if (getpid() != rootpid)
+		return;
+	onint();			/* 声明为 noreturn：exraise(EXINT) */
+}
+
 /* 从持久 fd 源驱动：无提示符版 cmdloop。EOF（NEOF）结束本次驱动但不
  * exitshell——会话命令 pipe 的 EOF 只在 shshd 关停时出现。每条命令的
  * 解析/执行异常仍经 main_handler：子进程 exitshell，根 shell reset

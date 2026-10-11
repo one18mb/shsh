@@ -8,6 +8,11 @@ void shsh_shell_init(void);
  * （shell 不自行退出进程，交由会话层处理）。返回命令退出状态。 */
 int shsh_shell_run_line(const char *line, int *want_exit);
 
+/* 放弃当前未完成的多行命令输入（如 if/heredoc 续行中途执行者离开）：
+ * 走 dash 原生 EXINT 恢复路径回到 PS1，丢弃半成品解析与已缓冲的续行。
+ * 仅在 shell 处于 PS2（whichprompt==2）且可 longjmp 的上下文中调用。 */
+void shsh_shell_abort(void);
+
 /* 把一个已打开的命令源 fd（通常是会话 pipe 的读端，调用方应放到 >=10
  * 以免与 shell 内部 fd 冲突）压为持久输入层，并驱动解析执行直到该 fd
  * EOF。未闭合引号/heredoc/行尾续行期间 parser 阻塞在 fd 上等后续写入，
