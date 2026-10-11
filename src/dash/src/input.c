@@ -160,6 +160,16 @@ int pgetc(void)
 }
 
 
+#ifdef SHSH_EMBED
+/* 会话命令源的"同步等待"钩子与目标 fd。
+ * shsh_cmd_wait 由会话层设置：当解析器需要更多命令输入而命令源尚未就绪时
+ * 被调用；它应在 fd 可读前同步驱动会话事件循环（epoll：客户端/pty），
+ * 把到达的 canonical 行写入 fd，然后返回（0=可读，-1=EOF/客户端断开）。
+ * 保持 shell 侧同步语义——不做异步状态机或挂起恢复。 */
+int (*shsh_cmd_wait)(int) = NULL;
+int shsh_cmd_fd = -1;
+#endif
+
 static int
 preadfd(void)
 {
@@ -193,6 +203,16 @@ retry:
 				rl_cp = 0;
 		}
 
+	} else
+#endif
+#ifdef SHSH_EMBED
+	/* 会话命令源：等待输入时同步驱动会话事件循环（见 shsh_cmd_wait 注释），
+	 * 不做异步挂起——解析器一直"等在原地"，事件循环在等待期间被同步调用。 */
+	if (shsh_cmd_wait && parsefile->fd == shsh_cmd_fd) {
+		if (shsh_cmd_wait(parsefile->fd) < 0)
+			nr = 0;
+		else
+			nr = read(parsefile->fd, buf, IBUFSIZ - 1);
 	} else
 #endif
 		nr = read(parsefile->fd, buf, IBUFSIZ - 1);
@@ -437,6 +457,7 @@ void
 shsh_setinputfd(int fd, int push)
 {
 	setinputfd(fd, push);
+	shsh_cmd_fd = fd;	/* 标记：会话命令源，等待时走同步钩子 */
 }
 #endif
 

@@ -139,7 +139,11 @@ shsh_shell_run_fd(int fd, int *want_exit)
 		*want_exit = 0;
 
 	INTOFF;
-	shsh_setinputfd(fd, 1);		/* push 持久命令源 */
+	/* 作为 basepf 本体（push=0），而非压栈层：dash 的 RESET 会
+	 * popallfiles() 弹回 basepf，若命令源是压栈层会在异常时被弹掉
+	 * （甚至二次释放）。放到 basepf 后，异常 reset 只清压栈层，
+	 * 命令源在多次异常/多条命令间保持。 */
+	shsh_setinputfd(fd, 0);
 	INTON;
 	setstackmark(&smark);
 
@@ -170,6 +174,6 @@ shsh_shell_run_fd(int fd, int *want_exit)
 	}
 
 	popstackmark(&smark);
-	popfile();				/* 弹出命令源（不关 fd） */
+	/* 命令源是 basepf，不 popfile（异常时 reset 已弹回 basepf） */
 	return status;
 }

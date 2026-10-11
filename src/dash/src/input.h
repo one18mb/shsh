@@ -106,6 +106,11 @@ void setinputstring(char *);
  * 未闭合引号/heredoc 跨行时自然等待后续写入）。会话层用 pipe 承载
  * canonical 行。命名沿用 dash 的 setinputfd。 */
 void shsh_setinputfd(int fd, int push);
+
+/* 同步等待钩子：解析器读命令源而数据未就绪时调用，用于同步驱动会话
+ * 事件循环（见 input.c 注释）。未设置（NULL）则回落为阻塞 read。 */
+extern int (*shsh_cmd_wait)(int);
+extern int shsh_cmd_fd;
 #endif
 void popfile(void);
 void unwindfiles(struct parsefile *);
