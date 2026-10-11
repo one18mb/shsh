@@ -714,6 +714,32 @@ def test_ctrl_d_hangs_up_foreground_job():
         clear_sockdir()
 
 
+def test_compound_command_aborted_on_drop():
+    """执行者运行复合命令（for）时掉线：终止**整个**命令，不只当前 pipeline"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        bob = join("work", "bob")
+        bob.assert_contains(ps1("alice"))
+
+        alice.send("for i in 1 2 3 4 5; do echo start-$i; sleep 1; done\n")
+        bob.assert_contains("start-1\r\n", timeout=5)
+        alice.kill()  # 掉线（前台任务的生命周期绑定在执行者上）
+        bob.assert_contains(ps1("bob"), timeout=5)  # 回到提示符
+        time.sleep(1.6)  # 若未整体终止，会继续输出 start-2/start-3
+        assert not bob.contains("start-2"), \
+            "掉线应终止整个复合命令: %r" % bob.text()
+        # 会话仍可用
+        bob.send("echo ok-after\n")
+        bob.assert_contains("ok-after\r\n", timeout=5)
+    finally:
+        kill_all([d, alice, bob])
+        clear_sockdir()
+
+
 def test_raw_program_termios_restored():
     """前台程序改过 termios（raw）后退出：会话层回空闲即复位行规程"""
     clear_sockdir()

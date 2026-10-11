@@ -351,10 +351,13 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
         *pp = c->next;
 
     if (c->has_name && c->id == s->executor_id) {
-        /* 执行者离开（^D/exit 或掉线）：一律挂断当前前台作业（含 TUI）。
-         * 统一策略——不把半程程序/TUI 留给下一位执行者（dash_decision.md）。 */
+        /* 前台任务的生命周期绑定在执行者上：执行者一离开，正在跑的前台作业
+         * 一律整组挂断（含 TUI），并放弃 shell 当前命令——运行中的复合命令
+         * （for/while）要继续下一轮、多行未完成（PS2）要被补完，都不允许。 */
         if (s->running)
             kill_foreground_job(s);
+        if (s->running || whichprompt == 2)
+            s->abort_cmd = true;
         client_t *nxt = first_named_client(s, 0);
         if (nxt) {
             s->executor_id = nxt->id;
@@ -366,11 +369,6 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
             broadcast_role(s);
             update_user(s);
         }
-        /* shell 停在未完成的多行命令（PS2）时，绝不把半成品交给新执行者
-         * 接手完成（否则命令归属被窃取）：标记放弃，回 shell 时经 EXINT
-         * 丢弃半成品解析并回到 PS1，新执行者从干净边界开始 */
-        if (!s->running && whichprompt == 2)
-            s->abort_cmd = true;
     }
     c->dead = true;
     buf_free(&c->in);
@@ -1143,8 +1141,9 @@ static int srv_cmd_wait(int fd)
         if (s->stopping)
             return -1;
         if (s->abort_cmd) {
-            /* 执行者中途离开、shell 停在未完成的多行命令：放弃半成品解析，
-             * 经 EXINT 回到 PS1（noreturn，不会返回到此处） */
+            /* 执行者离开、shell 停在未完成的多行命令（PS2）：放弃半成品
+             * 解析，经 EXINT 回到 PS1（noreturn，不会返回到此处）。
+             * 运行态（复合命令）的情形在 srv_job_wait 处理。 */
             s->abort_cmd = false;
             shsh_shell_abort();
         }
@@ -1171,6 +1170,14 @@ static void srv_job_wait(void)
         return;
     s->running = true;
     session_drive(s, false);
+    if (s->abort_cmd) {
+        /* 执行者离开：结束**整个**前台任务（不只是当前 pipeline）——放弃
+         * shell 当前命令的执行（EXINT），复合命令不再继续下一轮。前台组
+         * 已在 client_disconnect 里挂断，清掉 pgid 免残留被后续 ^C 误用。 */
+        s->abort_cmd = false;
+        shsh_fg_pgid = 0;
+        shsh_shell_abort(); /* noreturn：回 run_fd 落点，丢弃当前命令 */
+    }
 }
 
 void session_free(session_t *s)
