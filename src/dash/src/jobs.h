@@ -108,6 +108,14 @@ struct job *vforkexec(union node *n, char **argv, const char *path, int idx);
 int waitforjob(struct job *);
 int stoppedjobs(void);
 
+#ifdef SHSH_EMBED
+/* 作业等待钩子：前台子进程运行期间，dash 的阻塞 wait 会停摆会话事件循环，
+ * 令 pty 输出无法广播、执行者输入无法送达。会话层设置本钩子后，dash 在
+ * 等待处改为"非阻塞 reap + 调用钩子同步驱动会话 epoll"，保持单线程同步
+ * 语义（见 jobs.c waitproc）。未设置（NULL）时回落原生阻塞 wait。 */
+extern void (*shsh_job_wait)(void);
+#endif
+
 #if ! JOBS
 #define setjobctl(on) ((void)(on))	/* do nothing */
 #endif

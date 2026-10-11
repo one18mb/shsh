@@ -90,6 +90,12 @@ static unsigned njobs;
 /* pid of last background process */
 pid_t backgndpid;
 
+#ifdef SHSH_EMBED
+/* 作业等待钩子（见 jobs.h）：由会话层设置，前台等待期间同步驱动会话事件
+ * 循环；NULL 时 waitproc 走原生阻塞 wait。 */
+void (*shsh_job_wait)(void) = NULL;
+#endif
+
 #if JOBS
 /* pgrp of shell on invocation */
 static int initialpgrp;
@@ -1188,6 +1194,13 @@ waitproc(int block, int *status)
 		flags |= WUNTRACED;
 #endif
 
+#ifdef SHSH_EMBED
+	/* shsh：前台等待不再阻塞在 wait3/sigsuspend，改为非阻塞 reap，未就绪
+	 * 时调用会话钩子同步驱动 epoll，再重试（保持单线程同步语义）。 */
+	if (shsh_job_wait && block == DOWAIT_BLOCK)
+		flags |= WNOHANG;
+#endif
+
 	do {
 		gotsigchld = 0;
 		do
@@ -1197,6 +1210,16 @@ waitproc(int block, int *status)
 		if (err || (err = -!block))
 			break;
 
+#ifdef SHSH_EMBED
+		if (shsh_job_wait) {
+			/* waitcmd：被非 CHLD 信号打断则应返回 0（同原生语义） */
+			if (pending_sig && block != DOWAIT_BLOCK)
+				break;
+			shsh_job_wait();
+			gotsigchld = 1;		/* 令外层条件继续循环重试 */
+			continue;
+		}
+#endif
 		sigblockall(&oldmask);
 
 		while (!gotsigchld && !pending_sig)
