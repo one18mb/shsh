@@ -13,12 +13,14 @@
 #include <termios.h>
 
 /*
- * 客户端始终工作在原始模式：本地不做行编辑、不做回显、不解释控制字符。
- * 所有字节（含 ^C/^D）通过 RAW 帧交给 shshd，由会话层按执行权与相位仲裁：
- *   - 普通字节：仅执行者写入共享 PTY，行规程回显后广播全员（输入过程实时可见）
- *   - ^C：仅执行者中断前台命令，人留在会话
- *   - ^D：任何用户离开会话（不影响作业），客户端随即结束自身
- * follower 与执行者的终端模式完全相同，区别只在服务端是否放行其字节。
+ * 客户端始终工作在原始模式：本地不做行编辑、不做回显、不解释控制字符，
+ * 也**不自行响应 ^C/^D**（哑管道）。所有字节（含 ^C/^D）一律通过 RAW 帧
+ * 交给 shshd，由会话层按"执行者/非执行者 + 相位"两模式裁决：
+ *   - 普通字节：仅执行者写入共享 PTY，行规程回显后广播全员（实时可见）
+ *   - 执行者：其前台是共享命令——^C/^D 交回 shshd（运行态转发给前台任务，
+ *     空闲态由会话级处理：^C 无效果、^D 离开会话）
+ *   - 非执行者：其前台即 shsh 自身——^C/^D 均结束本客户端（离开会话）
+ * 是否退出由服务端回 BYE 决定；follower 与执行者的终端模式完全相同。
  */
 
 static struct termios g_saved;
@@ -103,9 +105,10 @@ static void send_raw(int fd, const void *p, size_t n)
     buf_free(&m.payload);
 }
 
-/* 转发一批 stdin 字节：普通字节成批上送；^C/^D 单独成帧由服务端解释。
- * *quit 置位表示收到 ^D / EOF，调用方应结束会话。 */
-static void forward_input(int sock, const uint8_t *p, size_t n, bool *quit)
+/* 转发一批 stdin 字节：普通字节成批上送；^C/^D 各自单独成帧。语义完全由
+ * 服务端裁决（客户端是哑管道：^C/^D 不再本地退出）——执行者的 ^C/^D 可能
+ * 被转交给其前台任务，follower 的则按 shsh 自身处理（离开）。 */
+static void forward_input(int sock, const uint8_t *p, size_t n)
 {
     size_t i = 0;
     while (i < n) {
@@ -118,11 +121,6 @@ static void forward_input(int sock, const uint8_t *p, size_t n, bool *quit)
             break;
         uint8_t ctl = p[i++];
         send_raw(sock, &ctl, 1);
-        if (ctl == 0x04) {
-            *quit = true; /* ^D：离开会话 */
-            return;
-        }
-        /* ^C：人留下，继续转发后续字节 */
     }
 }
 
@@ -187,7 +185,7 @@ int client_join(const char *session, const char *name)
 
     buf_t in;
     buf_init(&in);
-    bool welcome = false, quit = false;
+    bool welcome = false, quit = false, stdin_eof = false;
     int rc = 0;
 
     while (!quit) {
@@ -198,7 +196,7 @@ int client_join(const char *session, const char *name)
         pfds[1].fd = sigfd;
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
-        pfds[2].fd = STDIN_FILENO;
+        pfds[2].fd = stdin_eof ? -1 : STDIN_FILENO; /* EOF 后不再监听 stdin */
         pfds[2].events = POLLIN;
         pfds[2].revents = 0;
         int pr = poll(pfds, 3, welcome ? -1 : 10000);
@@ -240,12 +238,13 @@ int client_join(const char *session, const char *name)
             uint8_t chunk[4096];
             ssize_t n = read(STDIN_FILENO, chunk, sizeof chunk);
             if (n == 0) {
-                /* stdin EOF：按 ^D 语义干净离开 */
+                /* stdin EOF：发一个 ^D 后停止监听 stdin，自身不退出——
+                 * 是否离开由服务端裁决（运行态会把它交给前台任务） */
                 uint8_t eot = 0x04;
                 send_raw(fd, &eot, 1);
-                quit = true;
+                stdin_eof = true;
             } else if (n > 0) {
-                forward_input(fd, chunk, (size_t)n, &quit);
+                forward_input(fd, chunk, (size_t)n);
             }
         }
 

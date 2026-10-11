@@ -483,8 +483,8 @@ static const char *sh_help_text =
     "\n"
     "快捷键（执行者）：\n"
     "  退格 / Ctrl+W / Ctrl+U  canonical 行编辑\n"
-    "  Ctrl+C               中断前台命令（TUI/raw 前台则作为按键送出；仅执行者）\n"
-    "  Ctrl+D               离开会话，并挂断当前前台作业（所有用户可用）\n"
+    "  Ctrl+C               执行者：中断前台命令（raw/TUI 前台作按键送出）；非执行者：离开\n"
+    "  Ctrl+D               执行者：运行态交给前台（如 EOF）、空闲态离开；非执行者：离开\n"
     "\n"
     "会话外：\n"
     "  shsh -l              列出所有会话\n"
@@ -714,14 +714,26 @@ static void handle_raw(session_t *s, client_t *c, const msg_t *m)
     for (size_t i = 0; i < len; i++) {
         unsigned char ch = data[i];
         if (ch == 0x04) {
-            leave = true; /* ^D：该用户离开；帧内后续字节忽略 */
+            /* ^D 两模式：非执行者——其前台即 shsh 自身，^D=退出（离开）；
+             * 执行者运行态——前台是共享命令，把 ^D 交给前台任务自定（canonical
+             * 得到 VEOF/EOF，raw 得到按键），人留在会话；执行者空闲/续行——
+             * 会话级离开（续行态同时放弃半成品，见 client_disconnect）。 */
+            if (c->id == s->executor_id && s->running) {
+                buf_append_byte(&pass, ch);
+                continue;
+            }
+            leave = true;
             break;
         }
         if (ch == 0x03) {
-            /* ^C：仅执行者、命令运行中才生效，人留下。按前台是否处于 raw
-             * 决定语义（同真实终端）——raw/TUI 把 ^C 作为按键写入 pty 交给
-             * 前台程序；常规前台则对整组 SIGINT。 */
-            if (c->id == s->executor_id && s->running && shsh_fg_pgid > 0) {
+            /* ^C 两模式：非执行者——前台即 shsh 自身，^C=结束（离开）；
+             * 执行者运行态——raw/TUI 把 ^C 作按键交前台，否则整组 SIGINT
+             * （我们关了 ISIG，需 shshd 代发）；空闲/续行无效果。 */
+            if (c->id != s->executor_id) {
+                leave = true;
+                break;
+            }
+            if (s->running && shsh_fg_pgid > 0) {
                 struct termios t;
                 if (tcgetattr(s->pty_slave, &t) == 0 && !(t.c_lflag & ICANON))
                     buf_append_byte(&pass, ch);

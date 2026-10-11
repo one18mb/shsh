@@ -685,8 +685,9 @@ def test_ctrl_c_interrupts_command():
         clear_sockdir()
 
 
-def test_ctrl_d_hangs_up_foreground_job():
-    """运行中 ^D：离开并挂断前台作业（与掉线统一策略），执行权移交"""
+def test_ctrl_d_forwarded_to_running_task():
+    """运行态执行者 ^D 交给前台任务自定：canonical 前台得到 EOF 后退出，
+    执行者留在会话（不离开）"""
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -697,19 +698,44 @@ def test_ctrl_d_hangs_up_foreground_job():
         bob.assert_contains(ps1("alice"))
         time.sleep(0.2)
 
-        alice.send("sleep 7777\n")
-        time.sleep(0.6)
-        alice.send(b"\x04")  # ^D：离开会话并挂断前台作业
-        assert alice.wait() == 0
-        time.sleep(0.5)
-
-        # 前台 sleep 应已被 SIGHUP 挂断；执行权转给 bob 并回到 PS1
-        bob.assert_contains(ps1("bob"), timeout=5)
-        pg = subprocess.run(["pgrep", "-f", "sleep 7777"],
-                            capture_output=True)
-        assert pg.returncode != 0, "^D 应挂断前台作业"
+        alice.send("cat\n")            # canonical 前台，读 fd0=stdin
+        time.sleep(0.4)
+        n = alice.count(ps1("alice"))
+        alice.send(b"\x04")            # ^D -> 转发 -> VEOF -> cat 结束
+        assert alice.wait_count(ps1("alice"), n + 1, timeout=5), alice.text()
+        assert alice.p.poll() is None, "运行态 ^D 不应离开会话"
+        alice.send("echo back\n")
+        alice.assert_contains("back\r\n", timeout=5)
     finally:
-        subprocess.run(["pkill", "-f", "sleep 7777"])
+        kill_all([d, alice, bob])
+        clear_sockdir()
+
+
+def test_follower_ctrl_keys_leave():
+    """非执行者：其前台即 shsh 自身，^C/^D 均结束其客户端（离开会话）"""
+    clear_sockdir()
+    d = start_server("work")
+    alice = bob = None
+    try:
+        alice = join("work", "alice")
+        alice.assert_contains(ps1("alice"))
+        bob = join("work", "bob")
+        bob.assert_contains(ps1("alice"))
+        time.sleep(0.2)
+
+        before = alice.text()
+        bob.send(b"\x04")              # follower ^D -> 离开
+        assert bob.wait() == 0, "follower ^D 应离开"
+        time.sleep(0.3)
+        assert alice.text() == before, "follower 离开不影响执行者"
+
+        # 换一个 follower，用 ^C 离开
+        bob = join("work", "bob")
+        bob.assert_contains(ps1("alice"))
+        time.sleep(0.2)
+        bob.send(b"\x03")              # follower ^C -> 结束本客户端
+        assert bob.wait() == 0, "follower ^C 应结束客户端"
+    finally:
         kill_all([d, alice, bob])
         clear_sockdir()
 
