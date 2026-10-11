@@ -190,6 +190,14 @@ setsignal(int signo)
 	else
 		action = S_IGN;
 	if (rootshell && action == S_DFL && !lvforked) {
+#ifdef SHSH_EMBED
+		/* shsh：主进程不由 ^C 直接中断（^C 由会话层 kill 前台组），但需
+		 * 捕获 waitforjob 合成的 raise(SIGINT)（jobs.c），使作业被 SIGINT
+		 * 终止后经 EXINT 回提示符、而非自杀。SIGTERM 不忽略（由 shshd
+		 * 经 signalfd 收编），SIGQUIT 同样不忽略、不接管。 */
+		if (signo == SIGINT)
+			action = S_CATCH;
+#else
 		switch (signo) {
 		case SIGINT:
 			if (iflag || minusc || sflag == 0)
@@ -213,6 +221,7 @@ setsignal(int signo)
 			break;
 #endif
 		}
+#endif /* SHSH_EMBED */
 	}
 
 	if (signo == SIGCHLD)

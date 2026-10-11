@@ -95,6 +95,10 @@ shsh_shell_init(void)
 
 	/* 固定 PS1 为 shsh 形态；dash 随后每次打印它即提示符。 */
 	setvar("PS1", SHSH_PS1, 0);
+
+	/* 信号策略（见 trap.c SHSH_EMBED 分支）：SIGINT 捕获为 EXINT 回提示符；
+	 * SIGTERM/SIGQUIT 保持默认，交由 shshd 经 signalfd 收编（不忽略）。 */
+	setsignal(SIGINT);
 }
 
 /* 执行一条 canonical 行（不含结尾换行）。
