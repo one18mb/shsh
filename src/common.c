@@ -39,13 +39,15 @@ bool sh_name_valid(const char *s)
     return true;
 }
 
+int shsh_log_fd = STDERR_FILENO;
+
 void log_info(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[shsh] ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    dprintf(shsh_log_fd, "[shsh] ");
+    vdprintf(shsh_log_fd, fmt, ap);
+    dprintf(shsh_log_fd, "\n");
     va_end(ap);
 }
 
@@ -53,9 +55,9 @@ void log_error(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[shsh] 错误: ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    dprintf(shsh_log_fd, "[shsh] 错误: ");
+    vdprintf(shsh_log_fd, fmt, ap);
+    dprintf(shsh_log_fd, "\n");
     va_end(ap);
 }
 
@@ -63,9 +65,9 @@ void fatal(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[shsh] 致命: ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    dprintf(shsh_log_fd, "[shsh] 致命: ");
+    vdprintf(shsh_log_fd, fmt, ap);
+    dprintf(shsh_log_fd, "\n");
     va_end(ap);
     exit(1);
 }

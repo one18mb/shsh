@@ -1,14 +1,14 @@
 #include "server.h"
 #include "buf.h"
 #include "common.h"
-#include "exec.h"
-#include "parse.h"
 #include "proto.h"
 #include "pty.h"
+#include "shsh_shell.h"
 
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -29,6 +29,12 @@
 /* executor_id == 0 表示由 shshd（系统虚拟用户）持有执行权 */
 #define SH_EXEC_SHSHD 0u
 #define SHSHD_NAME "shshd"
+
+/* shell 层同步钩子（定义在 dash 层 input.c / jobs.c，见 dash_decision.md 6）。
+ * 会话层在 session_start 里把自己注册进去，把 dash 的"等命令 / 等前台作业"
+ * 变成对会话事件循环的同步驱动，单线程、不异步。 */
+extern int (*shsh_cmd_wait)(int);
+extern void (*shsh_job_wait)(void);
 
 typedef struct client {
     int fd;
@@ -54,35 +60,31 @@ struct session {
     int pty_slave;
     bool pty_tio_ok;
     struct termios pty_tio;
-    char cwd[PATH_MAX]; /* 会话工作目录（cd 内建维护） */
-    int last_status; /* 上一条命令的 $? */
-    /* 执行器状态：一行提交的命令按语句/pipeline 推进 */
-    sh_program_t cur_prog; /* 正在执行的一行 */
-    sh_stmt_t *cur_stmt;   /* 下一条待执行语句 */
-    int line_status;       /* 当前行的状态（&& / || 短路依据） */
-    pid_t kids[16];        /* 当前 pipeline 的子进程 */
-    size_t nkids;
-    pid_t cur_pgid;   /* 当前 pipeline 的进程组 */
-    pid_t last_kid;   /* 最后一个子进程（其状态即 pipeline 状态） */
-    int pipeline_status;
-    bool exec_stop; /* exit / to：终止本行后续语句 */
-    client_t *clients; /* 按连接顺序，头部 = 最早加入 */
+    /* 命令管道：[0]=shell 层命令源读端（>=10），[1]=会话层写端 */
+    int cmd_pipe[2];
+    bool slave_armed;   /* pty slave 是否已注册进 epoll */
+    bool running;       /* 前台命令执行中（两个钩子切换，供 ^C/相位判断） */
+    bool user_dirty;    /* 运行态发生的执行权变更，待空闲时注入 SHSH_USER */
+    pid_t cur_pgid;     /* 当前前台进程组（^C/HUP 用；由 shell 层回填） */
+    client_t *clients;  /* 按连接顺序，头部 = 最早加入 */
     uint32_t next_id;
     uint32_t executor_id;
-    bool running;
-    uint32_t run_client_id; /* 收到 RUN_BEGIN 的客户端；0 = 无 */
     bool stopping;
     /* 空闲态从 pty slave 读到的 canonical 行缓冲（可能一次读到多行） */
     char cmd_buf[4096];
     size_t cmd_len;
 };
 
+/* 钩子无 context，经此全局取得当前会话（单会话单进程） */
+static session_t *g_session;
+
 static void client_disconnect(session_t *s, client_t *c, bool unused_err);
 static bool flush_out(session_t *s, client_t *c);
-static void broadcast_ps1(session_t *s);
-static void send_ps1_to(session_t *s, client_t *c);
 static void kill_foreground_job(session_t *s);
 static void cmd_to(session_t *s, client_t *c, const char *target);
+static void request_leave(session_t *s, client_t *c);
+static int srv_cmd_wait(int fd);
+static void srv_job_wait(void);
 
 /* ---- 基础工具 ---- */
 
@@ -226,55 +228,10 @@ static const char *executor_name(session_t *s)
     return c ? c->name : SHSHD_NAME;
 }
 
-/* \W = 当前文件夹名 */
-static void cwd_basename(session_t *s, char *out, size_t sz)
-{
-    const char *b = strrchr(s->cwd, '/');
-    const char *src = b ? (b[1] ? b + 1 : "/") : s->cwd;
-    size_t n = strlen(src);
-    if (n >= sz)
-        n = sz - 1;
-    memcpy(out, src, n);
-    out[n] = '\0';
-}
-
-static void compose_ps1(session_t *s, char *out, size_t sz)
-{
-    char w[300];
-    cwd_basename(s, w, sizeof w);
-    snprintf(out, sz, "%s:%s$ ", executor_name(s), w);
-}
-
-static void broadcast_ps1(session_t *s)
-{
-    if (s->running)
-        return;
-    char ps1[512];
-    compose_ps1(s, ps1, sizeof ps1);
-    msg_t m;
-    msg_make_out(&m, ps1, strlen(ps1));
-    broadcast_msg(s, &m);
-    buf_free(&m.payload);
-}
-
-static void send_ps1_to(session_t *s, client_t *c)
-{
-    if (s->running)
-        return;
-    char ps1[512];
-    compose_ps1(s, ps1, sizeof ps1);
-    msg_t m;
-    msg_make_out(&m, ps1, strlen(ps1));
-    send_msg(s, c, &m, false);
-    buf_free(&m.payload);
-}
-
 /* shshd 执行 to：唯一的系统广播。显示为新行上的 shshd 命令行 */
 static void sys_to_line(session_t *s, const char *target)
 {
-    char w[300];
-    cwd_basename(s, w, sizeof w);
-    out_text(s, "\n%s:%s$ to %s\n", SHSHD_NAME, w, target);
+    out_text(s, "\n%s$ to %s\n", SHSHD_NAME, target);
 }
 
 static void broadcast_role(session_t *s)
@@ -312,6 +269,8 @@ static bool flush_out(session_t *s, client_t *c)
     return true;
 }
 
+static void update_user(session_t *s);
+
 static void client_disconnect(session_t *s, client_t *c, bool unused_err)
 {
     (void)unused_err;
@@ -324,8 +283,6 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
         pp = &(*pp)->next;
     if (*pp)
         *pp = c->next;
-    if (s->run_client_id == c->id)
-        s->run_client_id = 0;
 
     if (c->has_name && c->id == s->executor_id) {
         /* 执行者离开：网络掉线先挂断前台作业；^D/exit 干净离开则保留作业 */
@@ -336,18 +293,11 @@ static void client_disconnect(session_t *s, client_t *c, bool unused_err)
             s->executor_id = nxt->id;
             sys_to_line(s, nxt->name);
             broadcast_role(s);
-            if (s->running) {
-                /* 命令仍在退出中：让新执行者接管输入（可 ^C） */
-                msg_t rb;
-                msg_make_run_begin(&rb);
-                send_msg(s, nxt, &rb, false);
-                buf_free(&rb.payload);
-                s->run_client_id = nxt->id;
-            } else {
-                broadcast_ps1(s);
-            }
+            update_user(s); /* 让 shell 打出带新执行者名的提示符 */
         } else {
             s->executor_id = SH_EXEC_SHSHD;
+            broadcast_role(s);
+            update_user(s);
         }
     }
     c->dead = true;
@@ -372,23 +322,7 @@ static void flush_all(session_t *s)
     log_error("关闭会话: 部分客户端未能刷新输出");
 }
 
-/* ---- 命令执行（自研最小 shell 引擎） ----
- *
- * 会话状态（cwd / 变量 / $?）保存在服务端；内建命令在服务端执行（重定向用 fd
- * 保存/恢复），外部命令在 pty 上 fork。每条 pipeline 一个进程组：Ctrl+C 与
- * 掉线挂断都由服务端 kill(-pgid) 完成，pty 本身不产生信号（见 exec.c 注释）。 */
-
-#define SH_MAX_PIPE 16
-
-/* 有界字符串拷贝（源可能远大于目标） */
-static void copy_str(char *dst, size_t n, const char *src)
-{
-    size_t l = strlen(src);
-    if (l >= n)
-        l = n - 1;
-    memcpy(dst, src, l);
-    dst[l] = '\0';
-}
+/* ---- pty 输出与前台作业 ---- */
 
 static void emit_out(session_t *s, const uint8_t *p, size_t n)
 {
@@ -400,41 +334,7 @@ static void emit_out(session_t *s, const uint8_t *p, size_t n)
     buf_free(&m.payload);
 }
 
-/* fd < 0 表示广播给所有客户端；否则写到该 fd（重定向场景） */
-static void emit_fd(session_t *s, int fd, const void *p, size_t n)
-{
-    if (!n)
-        return;
-    if (fd < 0) {
-        emit_out(s, p, n);
-        return;
-    }
-    const uint8_t *b = p;
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, b + off, n - off);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        off += (size_t)w;
-    }
-}
-
-static void emit_fmt(session_t *s, int fd, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
-
-static void emit_fmt(session_t *s, int fd, const char *fmt, ...)
-{
-    char buf[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    emit_fd(s, fd, buf, strlen(buf));
-}
-
+/* pty master 侧读：行规程回显、shell 层输出、前台命令输出都从这里广播 */
 static void pty_read_all(session_t *s)
 {
     uint8_t buf[65536];
@@ -448,62 +348,15 @@ static void pty_read_all(session_t *s)
     }
 }
 
-/* 挂断当前 pipeline（执行者掉线 / 会话结束） */
+/* 挂断当前前台进程组（执行者掉线 / 会话结束） */
 static void kill_foreground_job(session_t *s)
 {
     if (s->running && s->cur_pgid > 0)
         kill(-s->cur_pgid, SIGHUP);
 }
 
-/* 变量查询：$? 取当前行已执行到的状态（行首为上一行状态），其余查环境 */
-static const char *var_lookup(void *ctx, const char *name)
-{
-    session_t *s = ctx;
-    if (strcmp(name, "?") == 0) {
-        static char buf[16];
-        snprintf(buf, sizeof buf, "%d", s->line_status);
-        return buf;
-    }
-    return getenv(name);
-}
+/* ---- 会话内 help（由会话层直接打印） ---- */
 
-/* 执行前展开：把命令的模板词与重定向目标展开为最终字符串
- * （在“执行到该语句”时才展开，因此 $? 与同行内先赋值后引用都正确） */
-static void materialize_command(session_t *s, sh_command_t *cmd)
-{
-    if (cmd->expanded)
-        return;
-    cmd->expanded = 1;
-    for (size_t i = 0; i < cmd->argc; i++) {
-        char *e = sh_expand_word(cmd->argv[i], var_lookup, s);
-        free(cmd->argv[i]);
-        cmd->argv[i] = e;
-    }
-    for (sh_redir_t *r = cmd->redirs; r; r = r->next) {
-        if (!r->target)
-            continue;
-        char *e = sh_expand_word(r->target, var_lookup, s);
-        free(r->target);
-        r->target = e;
-    }
-}
-
-/* ---- 内建命令 ---- */
-
-static bool bi_is_state(const char *n)
-{
-    return strcmp(n, "cd") == 0 || strcmp(n, "export") == 0 ||
-           strcmp(n, "unset") == 0 || strcmp(n, "to") == 0 ||
-           strcmp(n, "exit") == 0;
-}
-
-static bool bi_is_output(const char *n)
-{
-    return strcmp(n, "echo") == 0 || strcmp(n, "pwd") == 0 ||
-           strcmp(n, "help") == 0;
-}
-
-/* 会话内 help：说明内建命令、执行权规则与快捷键 */
 static const char *sh_help_text =
     "shsh — 多用户共享 shell\n"
     "\n"
@@ -532,462 +385,96 @@ static const char *sh_help_text =
     "  shsh -l              列出所有会话\n"
     "  shsh -l -s <会话>    列出该会话的用户\n"
     "  shsh -s <会话> -n <用户名>   加入会话\n"
-    "  shshd <会话>         启动会话\n"
-    "\n"
-    "当前 shell 不支持：通配符、$(...)、前缀赋值、&/作业控制、\n"
-    "if/for/while 等复合语句；需要时可用 sh -c '...'。\n";
+    "  shshd <会话>         启动会话\n";
 
-static void cmd_help(session_t *s, int out_fd)
+static void cmd_help(session_t *s)
 {
-    emit_fd(s, out_fd, sh_help_text, strlen(sh_help_text));
+    emit_out(s, (const uint8_t *)sh_help_text, strlen(sh_help_text));
 }
 
-/* 会话变量赋值：NAME=value */
-static bool apply_assignment(const char *word)
+/* 转交执行权。target 为 "shshd" 时由 shshd 立即再转交给其他用户 */
+static void cmd_to(session_t *s, client_t *c, const char *target)
 {
-    const char *eq = strchr(word, '=');
-    if (!eq || eq == word)
-        return false;
-    for (const char *q = word; q < eq; q++)
-        if (!(isalnum((unsigned char)*q) || *q == '_') ||
-            (q == word && isdigit((unsigned char)*q)))
-            return false;
-    char *name = xmalloc((size_t)(eq - word) + 1);
-    memcpy(name, word, (size_t)(eq - word));
-    name[eq - word] = '\0';
-    if (setenv(name, eq + 1, 1) != 0)
-        log_error("setenv %s 失败: %s", name, strerror(errno));
-    free(name);
-    return true;
-}
-
-static void cmd_cd(session_t *s, const sh_command_t *cmd, int err_fd)
-{
-    const char *arg = cmd->argc > 1 ? cmd->argv[1] : getenv("HOME");
-    if (!arg || !*arg)
-        arg = "/";
-    char path[PATH_MAX];
-    if (arg[0] == '~' && (arg[1] == '\0' || arg[1] == '/')) {
-        const char *home = getenv("HOME");
-        if (!home)
-            home = "/";
-        snprintf(path, sizeof path, "%s%s", home, arg + 1);
-    } else {
-        snprintf(path, sizeof path, "%s", arg);
-    }
-    char resolved[PATH_MAX];
-    if (!realpath(path, resolved)) {
-        emit_fmt(s, err_fd, "cd: %s: %s\n", arg, strerror(errno));
-        s->last_status = 1;
+    if (target[0] == '\0') {
+        out_text(s, "to: 用法: to <用户>\r\n");
+        update_user(s);
         return;
     }
-    copy_str(s->cwd, sizeof s->cwd, resolved);
-    s->last_status = 0;
+    if (strcmp(target, SHSHD_NAME) == 0) {
+        s->executor_id = SH_EXEC_SHSHD;
+        client_t *t = first_named_client(s, c->id);
+        if (t) {
+            s->executor_id = t->id;
+            sys_to_line(s, t->name);
+        }
+        broadcast_role(s);
+        update_user(s);
+        return;
+    }
+    client_t *t = client_by_name(s, target);
+    if (t == c) {
+        out_text(s, "to: 不能转交给自己\r\n");
+    } else if (!t) {
+        out_text(s, "to: 用户 %s 不在会话中\r\n", target);
+    } else {
+        s->executor_id = t->id;
+        broadcast_role(s);
+    }
+    update_user(s);
 }
 
-/* 内建命令实现（服务端与子进程共用）。返回状态；
- * *stop 表示需要终止本行后续语句（exit / to）。 */
-static int run_builtin(session_t *s, const sh_command_t *cmd, int out_fd,
-                       int err_fd, bool in_child, bool *stop)
-{
-    *stop = false;
-    const char *name = cmd->argc > 0 ? cmd->argv[0] : NULL;
-    if (!name)
-        return 0;
+/* ---- 命令源：pty slave → 命令管道 ----
+ *
+ * 空闲态执行者的键入经 master 进入行规程（canonical+ECHO），回显由 master
+ * 读出广播；回车交付的整行从 slave 读出，由会话层按行拦截 to/exit/help，
+ * 普通行写入命令管道交给 shell 层解析执行。运行命令期间注销 slave 读，
+ * 输入归前台程序所有。 */
 
-    if (strcmp(name, "echo") == 0) {
-        bool nl = true;
-        size_t i = 1;
-        if (cmd->argc > 1 && strcmp(cmd->argv[1], "-n") == 0) {
-            nl = false;
-            i = 2;
-        }
-        buf_t out;
-        buf_init(&out);
-        for (size_t k = i; k < cmd->argc; k++) {
-            if (k > i)
-                buf_append_byte(&out, ' ');
-            buf_append_str(&out, cmd->argv[k]);
-        }
-        if (nl)
-            buf_append_str(&out, "\n");
-        emit_fd(s, out_fd, out.data, out.len);
-        buf_free(&out);
-        return 0;
-    }
-    if (strcmp(name, "pwd") == 0) {
-        emit_fmt(s, out_fd, "%s\n", s->cwd);
-        return 0;
-    }
-    if (strcmp(name, "help") == 0) {
-        cmd_help(s, out_fd);
-        return 0;
-    }
-    if (strcmp(name, "cd") == 0) {
-        if (in_child) {
-            /* 子进程内 cd 只影响自身副本，等价于无副作用 */
-            s->last_status = 0;
-            return 0;
-        }
-        cmd_cd(s, cmd, err_fd);
-        return s->last_status;
-    }
-    if (strcmp(name, "export") == 0) {
-        bool ok = true;
-        for (size_t i = 1; i < cmd->argc; i++) {
-            if (!apply_assignment(cmd->argv[i])) {
-                emit_fmt(s, err_fd, "export: 用法: export NAME=value\n");
-                ok = false;
-                break;
-            }
-        }
-        s->last_status = ok ? 0 : 1;
-        return s->last_status;
-    }
-    if (strcmp(name, "unset") == 0) {
-        for (size_t i = 1; i < cmd->argc; i++)
-            unsetenv(cmd->argv[i]);
-        s->last_status = 0;
-        return 0;
-    }
-    if (strcmp(name, "exit") == 0) {
-        if (in_child) {
-            s->last_status = 0;
-            *stop = true;
-            return 0;
-        }
-        s->last_status = 0;
-        *stop = true; /* 由调用方发 BYE 并关闭 */
-        return 0;
-    }
-    if (strcmp(name, "to") == 0) {
-        if (in_child) {
-            emit_fmt(s, err_fd, "to: 只能在会话中直接执行\n");
-            s->last_status = 1;
-            return 1;
-        }
-        *stop = true; /* 由调用方处理（需要客户端上下文） */
-        return 0;
-    }
-    return 127; /* 非内建 */
+static void cmd_read_arm(session_t *s)
+{
+    if (s->slave_armed)
+        return;
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = s->pty_slave};
+    if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->pty_slave, &ev) == 0)
+        s->slave_armed = true;
 }
 
-/* 子进程内的内建命令（管道 / 重定向场景） */
-static int child_builtin(void *ctx, const sh_command_t *cmd)
+static void cmd_read_disarm(session_t *s)
 {
-    session_t *s = ctx;
-    const char *name = cmd->argc > 0 ? cmd->argv[0] : NULL;
-    if (!name || (!bi_is_state(name) && !bi_is_output(name)))
-        return 127;
-    bool stop = false;
-    int st = run_builtin(s, cmd, STDOUT_FILENO, STDERR_FILENO, true, &stop);
-    if (stop)
-        return st; /* 子进程内 exit：直接返回 */
-    return st;
+    if (!s->slave_armed)
+        return;
+    epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->pty_slave, NULL);
+    s->slave_armed = false;
 }
 
-/* ---- 服务端内建命令的重定向（fd 保存/恢复） ---- */
-
-typedef struct {
-    int fd[8];
-    int saved[8];
-    int n;
-} saved_fds_t;
-
-static bool redir_touches(const sh_command_t *cmd, int fd)
+/* 把一段文本（含结尾换行）注入 shell 命令源 */
+static void inject_line(session_t *s, const char *line)
 {
-    for (const sh_redir_t *r = cmd->redirs; r; r = r->next)
-        if (r->fd == fd)
-            return true;
-    return false;
-}
-
-static bool redir_apply_srv(const sh_command_t *cmd, saved_fds_t *sv,
-                            char *err, size_t errsz)
-{
-    sv->n = 0;
-    for (const sh_redir_t *r = cmd->redirs; r; r = r->next) {
-        if (sv->n >= (int)(sizeof sv->fd / sizeof sv->fd[0])) {
-            snprintf(err, errsz, "重定向过多");
-            return false;
-        }
-        int saved = dup(r->fd);
-        if (saved < 0 && errno != EBADF) {
-            snprintf(err, errsz, "保存 fd %d 失败: %s", r->fd, strerror(errno));
-            return false;
-        }
-        sv->fd[sv->n] = r->fd;
-        sv->saved[sv->n] = saved;
-        sv->n++;
-
-        if (r->kind == SH_RD_DUP) {
-            if (dup2(r->dup_fd, r->fd) < 0) {
-                snprintf(err, errsz, "%d>&%d: %s", r->fd, r->dup_fd,
-                         strerror(errno));
-                return false;
-            }
-            continue;
-        }
-        int flags = r->kind == SH_RD_OUT
-                        ? (O_WRONLY | O_CREAT | O_TRUNC)
-                        : (r->kind == SH_RD_APPEND
-                               ? (O_WRONLY | O_CREAT | O_APPEND)
-                               : O_RDONLY);
-        int nfd = open(r->target, flags, 0666);
-        if (nfd < 0) {
-            snprintf(err, errsz, "%s: %s", r->target, strerror(errno));
-            return false;
-        }
-        if (dup2(nfd, r->fd) < 0) {
-            snprintf(err, errsz, "重定向 fd %d 失败: %s", r->fd,
-                     strerror(errno));
-            close(nfd);
-            return false;
-        }
-        if (nfd > STDERR_FILENO)
-            close(nfd);
-    }
-    return true;
-}
-
-static void redir_undo_srv(saved_fds_t *sv)
-{
-    for (int i = 0; i < sv->n; i++) {
-        if (sv->saved[i] >= 0) {
-            dup2(sv->saved[i], sv->fd[i]);
-            close(sv->saved[i]);
-        } else {
-            close(sv->fd[i]);
-        }
-    }
-    sv->n = 0;
-}
-
-static void send_cycle_begin(session_t *s, client_t *c)
-{
-    msg_t m;
-    msg_make_run_begin(&m);
-    send_msg(s, c, &m, false);
-    buf_free(&m.payload);
-}
-
-static void send_cycle_end(session_t *s, client_t *c, int status)
-{
-    msg_t m;
-    msg_make_run_end(&m, status);
-    send_msg(s, c, &m, false);
-    buf_free(&m.payload);
-}
-
-/* ---- 执行器：一行 → 语句 → pipeline ---- */
-
-static void exec_advance(session_t *s);
-static void cmd_pump(session_t *s);
-
-static void finish_line(session_t *s)
-{
-    int status = s->line_status;
-    s->last_status = status;
-    s->running = false;
-    s->cur_stmt = NULL;
-    s->exec_stop = false;
-    s->nkids = 0;
-    s->cur_pgid = 0;
-    sh_program_free(&s->cur_prog);
-    client_t *rc =
-        s->run_client_id ? client_by_id(s, s->run_client_id) : NULL;
-    s->run_client_id = 0;
-    if (rc) {
-        msg_t re;
-        msg_make_run_end(&re, status);
-        send_msg(s, rc, &re, false);
-        buf_free(&re.payload);
-    }
-    broadcast_ps1(s);
-}
-
-/* 启动一条 pipeline。返回其状态；*forked 表示已 fork（等 SIGCHLD 推进） */
-static int start_pipeline(session_t *s, sh_pipeline_t *pl, bool *forked)
-{
-    *forked = false;
-    size_t n = pl->n;
-
-    /* 单条命令：赋值与内建在服务端执行 */
-    if (n == 1 && pl->cmds[0]->argc > 0) {
-        sh_command_t *cmd = pl->cmds[0];
-        materialize_command(s, cmd);
-        const char *name = cmd->argv[0];
-        bool is_asg = cmd->argc == 1 && apply_assignment(name);
-        bool is_prefix_asg =
-            !is_asg && cmd->argc > 1 && apply_assignment(name);
-        if (is_asg)
-            return 0;
-        if (is_prefix_asg) {
-            emit_fmt(s, -1, "shsh: 暂不支持前缀赋值（%s ...）\n", name);
-            return 2;
-        }
-        if (bi_is_state(name) || bi_is_output(name)) {
-            saved_fds_t sv;
-            char err[160] = "";
-            if (!redir_apply_srv(cmd, &sv, err, sizeof err)) {
-                emit_fmt(s, -1, "shsh: %s\n", err);
-                redir_undo_srv(&sv);
-                return 1;
-            }
-            int out_fd = redir_touches(cmd, STDOUT_FILENO) ? STDOUT_FILENO : -1;
-            int err_fd = redir_touches(cmd, STDERR_FILENO) ? STDERR_FILENO : -1;
-            bool stop = false;
-            int st = run_builtin(s, cmd, out_fd, err_fd, false, &stop);
-            redir_undo_srv(&sv);
-            if (stop) {
-                client_t *c =
-                    s->run_client_id ? client_by_id(s, s->run_client_id)
-                                     : NULL;
-                if (strcmp(name, "exit") == 0 && c) {
-                    msg_t bye;
-                    msg_make_bye(&bye, "已退出会话");
-                    send_msg(s, c, &bye, false);
-                    buf_free(&bye.payload);
-                    c->want_close = true;
-                } else if (strcmp(name, "to") == 0) {
-                    cmd_to(s, c, cmd->argc > 1 ? cmd->argv[1] : "");
-                }
-                s->exec_stop = true;
-            }
-            return st;
-        }
-    }
-
-    /* fork 路径（管道 / 外部命令 / 纯重定向） */
-    if (n > SH_MAX_PIPE) {
-        emit_fmt(s, -1, "shsh: 管道过长（最多 %d 段）\n", SH_MAX_PIPE);
-        return 1;
-    }
-    int npipe = (int)n - 1;
-    int pfd[SH_MAX_PIPE][2];
-    int close_fds[SH_MAX_PIPE * 2];
-    size_t nclose = 0;
-    for (int i = 0; i < npipe; i++) {
-        if (pipe2(pfd[i], O_CLOEXEC) != 0) {
-            emit_fmt(s, -1, "shsh: 创建管道失败: %s\n", strerror(errno));
-            for (int k = 0; k < i; k++) {
-                close(pfd[k][0]);
-                close(pfd[k][1]);
-            }
-            return 1;
-        }
-        close_fds[nclose++] = pfd[i][0];
-        close_fds[nclose++] = pfd[i][1];
-    }
-
-    pid_t pgid = 0;
-    s->nkids = 0;
-    s->last_kid = 0;
-    s->pipeline_status = 0;
-    memset(s->kids, 0, sizeof s->kids);
-    for (size_t i = 0; i < n; i++) {
-        sh_command_t *cmd = pl->cmds[i];
-        materialize_command(s, cmd);
-        int in_fd = (i == 0) ? s->pty_slave : pfd[i - 1][0];
-        int out_fd = (i + 1 == n) ? s->pty_slave : pfd[i][1];
-        int err_fd = s->pty_slave;
-        /* 显式重定向优先：该 fd 已被重定向时不再套用管道/pty 默认 */
-        if (redir_touches(cmd, STDIN_FILENO))
-            in_fd = -1;
-        if (redir_touches(cmd, STDOUT_FILENO))
-            out_fd = -1;
-        if (redir_touches(cmd, STDERR_FILENO))
-            err_fd = -1;
-        const char *cn = cmd->argc > 0 ? cmd->argv[0] : NULL;
-        sh_child_fn fn = (cn && (bi_is_state(cn) || bi_is_output(cn)))
-                             ? child_builtin
-                             : NULL;
-        pid_t pid = exec_spawn(cmd, pgid, s->cwd, in_fd, out_fd, err_fd,
-                               close_fds, nclose, fn, s);
-        if (pid < 0) {
-            emit_fmt(s, -1, "shsh: fork 失败: %s\n", strerror(errno));
-            for (int k = 0; k < npipe; k++) {
-                close(pfd[k][0]);
-                close(pfd[k][1]);
-            }
-            s->pipeline_status = 1;
-            s->nkids = 0;
-            return 1;
-        }
-        if (pgid == 0)
-            pgid = pid;
-        if (s->nkids < sizeof s->kids / sizeof s->kids[0])
-            s->kids[s->nkids++] = pid;
-        s->last_kid = pid;
-    }
-    for (int i = 0; i < npipe; i++) {
-        close(pfd[i][0]);
-        close(pfd[i][1]);
-    }
-    s->cur_pgid = pgid;
-    *forked = true;
-    return 0;
-}
-
-static void exec_advance(session_t *s)
-{
-    for (;;) {
-        if (s->exec_stop || !s->cur_stmt) {
-            finish_line(s);
-            return;
-        }
-        sh_stmt_t *st = s->cur_stmt;
-        if ((st->op == SH_OP_AND && s->line_status != 0) ||
-            (st->op == SH_OP_OR && s->line_status == 0)) {
-            s->cur_stmt = st->next; /* 短路 */
-            continue;
-        }
-        s->cur_stmt = st->next;
-        bool forked = false;
-        int st_status = start_pipeline(s, st->pl, &forked);
-        if (forked)
-            return;
-        s->line_status = st_status;
-    }
-}
-
-static void on_child_exit(session_t *s)
-{
-    bool done = false;
-    for (;;) {
-        int status = 0;
-        pid_t p = waitpid(-1, &status, WNOHANG);
-        if (p <= 0)
-            break;
-        /* 固定边界遍历：nkids 在循环内会减小，不能用它作上界 */
-        for (size_t i = 0; i < SH_MAX_PIPE; i++) {
-            if (s->kids[i] != p)
+    size_t n = strlen(line);
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(s->cmd_pipe[1], line + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR)
                 continue;
-            s->kids[i] = 0;
-            if (p == s->last_kid)
-                s->pipeline_status = WIFEXITED(status)
-                                         ? WEXITSTATUS(status)
-                                         : 128 + WTERMSIG(status);
-            s->nkids--;
-            if (s->nkids == 0)
-                done = true;
             break;
         }
-    }
-    if (done) {
-        pty_read_all(s); /* 收尾输出 */
-        /* 程序可能留下改动过的 termios（如 raw TUI），恢复规范态后
-         * 再重新接收命令行；cmd_pump 会处理缓冲中已交付的残余行 */
-        if (s->pty_tio_ok)
-            tcsetattr(s->pty_slave, TCSANOW, &s->pty_tio);
-        s->line_status = s->pipeline_status;
-        exec_advance(s);
-        if (!s->running)
-            cmd_pump(s);
+        off += (size_t)w;
     }
 }
 
-/* ---- 命令处理 ---- */
+/* 执行权变更后刷新提示符：空闲时直接注入 SHSH_USER 赋值（shell 随后的
+ * 提示符即带新执行者名）；运行态先记脏，待下一次空闲再注入。 */
+static void update_user(session_t *s)
+{
+    if (s->running) {
+        s->user_dirty = true;
+        return;
+    }
+    char line[SH_NAME_MAX + 16];
+    snprintf(line, sizeof line, "SHSH_USER=%s\n", executor_name(s));
+    inject_line(s, line);
+}
 
 static bool line_token(const char *line, const char *tok, const char **rest)
 {
@@ -1005,39 +492,81 @@ static bool line_token(const char *line, const char *tok, const char **rest)
     return true;
 }
 
-/* 转交执行权。target 为 "shshd" 时由 shshd 立即再转交给其他用户 */
-static void cmd_to(session_t *s, client_t *c, const char *target)
+/* 处理 cmd_buf 中已交付的完整行：拦截 to/exit/help；普通行写入命令管道。
+ * 返回 true 表示已把内容交给 shell（普通行或刷新提示符的注入），
+ * 调用方应让 shell 继续。 */
+static bool deliver_lines(session_t *s)
 {
-    if (target[0] == '\0') {
-        out_text(s, "to: 用法: to <用户>\r\n");
-        broadcast_ps1(s);
-        return;
-    }
-    if (strcmp(target, SHSHD_NAME) == 0) {
-        s->executor_id = SH_EXEC_SHSHD;
-        client_t *t = first_named_client(s, c->id);
-        if (t) {
-            s->executor_id = t->id;
-            sys_to_line(s, t->name);
+    for (;;) {
+        char *nl = memchr(s->cmd_buf, '\n', s->cmd_len);
+        if (!nl)
+            return false;
+        size_t llen = (size_t)(nl - s->cmd_buf);
+        char line[4096];
+        size_t n = llen;
+        if (n >= sizeof line)
+            n = sizeof line - 1;
+        memcpy(line, s->cmd_buf, n);
+        line[n] = '\0';
+        size_t consumed = llen + 1;
+        s->cmd_len -= consumed;
+        memmove(s->cmd_buf, s->cmd_buf + consumed, s->cmd_len);
+
+        /* 行规程已回显整行；此处按行首词法精确匹配拦截 */
+        if (line_token(line, "exit", NULL)) {
+            client_t *c = client_by_id(s, s->executor_id);
+            if (c)
+                request_leave(s, c);
+            continue;
         }
-        broadcast_role(s);
-        broadcast_ps1(s); /* 无一用户时提示符为 shshd:\W$ ，无人可输入 */
-        return;
+        const char *rest = NULL;
+        if (line_token(line, "to", &rest)) {
+            client_t *c = client_by_id(s, s->executor_id);
+            if (c)
+                cmd_to(s, c, rest);
+            continue;
+        }
+        if (line_token(line, "help", NULL)) {
+            cmd_help(s);
+            inject_line(s, "\n"); /* 让 shell 回到 PS1 */
+            return true;
+        }
+        /* 普通行（含空行）：交给 shell 解析执行 */
+        inject_line(s, line);
+        inject_line(s, "\n");
+        return true;
     }
-    client_t *t = client_by_name(s, target);
-    if (t == c) {
-        out_text(s, "to: 不能转交给自己\r\n");
-    } else if (!t) {
-        out_text(s, "to: 用户 %s 不在会话中\r\n", target);
-    } else {
-        s->executor_id = t->id;
-        broadcast_role(s);
-    }
-    broadcast_ps1(s);
 }
 
-/* 用户请求离开（^D 或 exit）：纯会话层动作，不向任何作业组发信号。
- * graceful=true 表示干净离开（作业保留）；网络掉线不带此标记。 */
+/* 命令源是否有待读内容：命令管道里已有残余，或 cmd_buf 攒齐了一行 */
+static bool have_pending_cmd(session_t *s)
+{
+    if (s->cmd_len && memchr(s->cmd_buf, '\n', s->cmd_len))
+        return true;
+    struct pollfd p = {.fd = s->cmd_pipe[0], .events = POLLIN};
+    return poll(&p, 1, 0) == 1 && (p.revents & POLLIN);
+}
+
+static void on_cmd_input(session_t *s)
+{
+    /* 行规程对所提交行的回显在 master 一侧，必须先于命令执行/执行权切换
+     * 广播出去，否则 shell 输出、移交后的新提示符会插到回显前面 */
+    pty_read_all(s);
+
+    char chunk[sizeof s->cmd_buf];
+    ssize_t r = read(s->pty_slave, chunk, sizeof chunk);
+    if (r > 0) {
+        if (s->cmd_len + (size_t)r > sizeof s->cmd_buf)
+            s->cmd_len = 0; /* 超长行：丢弃保护，等下一规范行 */
+        else {
+            memcpy(s->cmd_buf + s->cmd_len, chunk, (size_t)r);
+            s->cmd_len += (size_t)r;
+        }
+    }
+}
+
+/* ---- 客户端输入 ---- */
+
 static void request_leave(session_t *s, client_t *c)
 {
     c->clean_leave = true;
@@ -1046,124 +575,6 @@ static void request_leave(session_t *s, client_t *c)
     send_msg(s, c, &bye, false);
     buf_free(&bye.payload);
     c->want_close = true;
-}
-
-/* 执行一条 canonical 行（行规程已完成全员回显，此处不再回显） */
-static void process_line(session_t *s, const char *line)
-{
-    client_t *c = client_by_id(s, s->executor_id);
-
-    if (line[0] == '\0') {
-        /* 空行：只给执行者补一个提示符 */
-        if (c)
-            send_ps1_to(s, c);
-        return;
-    }
-
-    if (line_token(line, "exit", NULL)) {
-        if (c)
-            request_leave(s, c);
-        return;
-    }
-    const char *rest = NULL;
-    if (line_token(line, "to", &rest)) {
-        if (c) {
-            send_cycle_begin(s, c);
-            cmd_to(s, c, rest);
-            send_cycle_end(s, c, 0);
-        }
-        return;
-    }
-
-    if (c)
-        send_cycle_begin(s, c);
-    sh_program_free(&s->cur_prog);
-    sh_parse(line, &s->cur_prog);
-    if (s->cur_prog.err[0]) {
-        out_text(s, "shsh: %s\n", s->cur_prog.err);
-        s->last_status = 2;
-        if (c)
-            send_cycle_end(s, c, 2);
-        broadcast_ps1(s);
-        return;
-    }
-    if (!s->cur_prog.stmts) {
-        s->last_status = 0;
-        if (c) {
-            send_cycle_end(s, c, 0);
-            send_ps1_to(s, c);
-        }
-        return;
-    }
-    s->running = true;
-    s->run_client_id = c ? c->id : 0;
-    s->line_status = s->last_status; /* $? 以进入本行前的状态起算 */
-    s->exec_stop = false;
-    s->cur_stmt = s->cur_prog.stmts;
-    s->nkids = 0;
-    s->cur_pgid = 0;
-    exec_advance(s); /* fork 路径由 SIGCHLD 继续推进 */
-}
-
-/* ---- 空闲态命令行：pty slave canonical 读 ----
- *
- * 执行者的键入经 master 进入行规程（canonical+ECHO），回显由 master 读出
- * 广播；回车交付的整行从 slave 读出送引擎。运行命令期间注销 slave 读，
- * 输入归前台程序所有，避免与子进程争抢同一个 tty 输入队列。 */
-
-static void cmd_read_arm(session_t *s)
-{
-    struct epoll_event ev = {.events = EPOLLIN, .data.fd = s->pty_slave};
-    epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->pty_slave, &ev);
-}
-
-static void cmd_read_disarm(session_t *s)
-{
-    epoll_ctl(s->epoll_fd, EPOLL_CTL_DEL, s->pty_slave, NULL);
-}
-
-/* 处理 cmd_buf 中已交付的完整行；进入运行态时残余行保留，待 finish_line 再泵 */
-static void cmd_pump(session_t *s)
-{
-    while (!s->running) {
-        char *nl = memchr(s->cmd_buf, '\n', s->cmd_len);
-        if (!nl)
-            break; /* 半行：继续等 canonical 交付 */
-        size_t llen = (size_t)(nl - s->cmd_buf);
-        char line[4096];
-        if (llen >= sizeof line)
-            llen = sizeof line - 1;
-        memcpy(line, s->cmd_buf, llen);
-        line[llen] = '\0';
-        size_t consumed = (size_t)(nl - s->cmd_buf) + 1;
-        s->cmd_len -= consumed;
-        memmove(s->cmd_buf, nl + 1, s->cmd_len);
-        process_line(s, line);
-    }
-    if (!s->running)
-        cmd_read_arm(s);
-}
-
-static void on_cmd_input(session_t *s)
-{
-    /* 行规程对所提交行的回显在 master 一侧，必须先于命令执行/执行权切换
-     * 广播出去，否则进程内内建的输出、移交后的新提示符会插到回显前面 */
-    pty_read_all(s);
-
-    char chunk[sizeof s->cmd_buf];
-    for (;;) {
-        ssize_t r = read(s->pty_slave, chunk, sizeof chunk);
-        if (r <= 0)
-            break; /* EAGAIN / EINTR */
-        if (s->cmd_len + (size_t)r > sizeof s->cmd_buf) {
-            s->cmd_len = 0; /* 超长行：丢弃保护，等下一规范行 */
-            continue;
-        }
-        memcpy(s->cmd_buf + s->cmd_len, chunk, (size_t)r);
-        s->cmd_len += (size_t)r;
-    }
-    cmd_read_disarm(s);
-    cmd_pump(s);
 }
 
 static void handle_raw(session_t *s, client_t *c, const msg_t *m)
@@ -1260,12 +671,8 @@ static void handle_hello(session_t *s, client_t *c, const msg_t *m)
     buf_free(&w.payload);
     broadcast_role(s);
 
-    if (!s->running) {
-        if (took_over)
-            broadcast_ps1(s);
-        else
-            send_ps1_to(s, c);
-    }
+    if (took_over)
+        update_user(s); /* 让 shell 打出带新执行者名的提示符 */
 }
 
 static void handle_list(session_t *s, client_t *c)
@@ -1376,6 +783,16 @@ const char *session_sockpath(session_t *s)
     return s->sockpath;
 }
 
+int session_cmd_fd(session_t *s)
+{
+    return s->cmd_pipe[0];
+}
+
+int session_pty_slave(session_t *s)
+{
+    return s->pty_slave;
+}
+
 int session_start(session_t **out, const char *name)
 {
     session_t *s = xmalloc(sizeof *s);
@@ -1385,8 +802,9 @@ int session_start(session_t **out, const char *name)
     s->next_id = 1; /* 0 保留给 shshd */
     s->pty_master = -1;
     s->pty_slave = -1;
-    if (!getcwd(s->cwd, sizeof s->cwd))
-        snprintf(s->cwd, sizeof s->cwd, "/");
+    s->cmd_pipe[0] = -1;
+    s->cmd_pipe[1] = -1;
+    s->executor_id = SH_EXEC_SHSHD;
 
     if (mkdir(SH_SOCK_DIR, 0777) != 0 && errno != EEXIST)
         fatal("无法创建 %s: %s", SH_SOCK_DIR, strerror(errno));
@@ -1413,9 +831,21 @@ int session_start(session_t **out, const char *name)
     if (pty_open(&s->pty_master, &s->pty_slave) != 0)
         fatal("无法创建 pty: %s", strerror(errno));
     s->pty_tio_ok = pty_config_shared(s->pty_slave, &s->pty_tio) == 0;
-    if (set_nonblock(s->pty_slave) != 0)
-        fatal("pty slave nonblock: %s", strerror(errno));
+    /* slave 保持阻塞：会话层读 canonical 行、shell 层 fd0/1/2 都指向它，
+     * 非阻塞会破坏 shell 的 read 内建与前台程序的行输入 */
     pty_set_size(s->pty_master, DEFAULT_ROWS, DEFAULT_COLS);
+
+    /* 命令管道：读端给 shell 层当命令源，移到 fd>=10 以避开 dash 内部
+     * 使用的 fd（其重定向保存槽从 10 起取最小可用，占用即跳过） */
+    if (pipe2(s->cmd_pipe, O_CLOEXEC) != 0)
+        fatal("创建命令管道失败: %s", strerror(errno));
+    {
+        int hi = fcntl(s->cmd_pipe[0], F_DUPFD_CLOEXEC, 10);
+        if (hi >= 0) {
+            close(s->cmd_pipe[0]);
+            s->cmd_pipe[0] = hi;
+        }
+    }
 
     s->listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s->listen_fd < 0)
@@ -1440,12 +870,12 @@ int session_start(session_t **out, const char *name)
     struct epoll_event pev = {.events = EPOLLIN, .data.fd = s->pty_master};
     if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->pty_master, &pev) < 0)
         fatal("epoll_ctl(pty): %s", strerror(errno));
-    /* 空闲态从 slave 读 canonical 行（初始 armed；运行命令时摘除） */
-    cmd_read_arm(s);
 
+    /* 信号收编：SIGTERM 关停会话，SIGCHLD 唤醒事件循环（由 shell 层 wait3
+     * 自行 reap，会话层消费后丢弃）。SIGINT 不入掩码——它由 shell 层捕获
+     * 用于中断合成与 EXINT 恢复，会话层不接管（见 dash_decision.md 3.1）。 */
     sigset_t mask;
     sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, NULL);
@@ -1457,14 +887,26 @@ int session_start(session_t **out, const char *name)
     if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->sig_fd, &sev) < 0)
         fatal("epoll_ctl(signal): %s", strerror(errno));
 
+    /* 初始执行者为 shshd：先落环境变量，shell 层 init 导入后首个提示符
+     * 即呈 "shshd:\W$ "（见 dash_decision.md 3.2） */
+    setenv("SHSH_USER", SHSHD_NAME, 1);
+
+    /* 注册 shell 层同步钩子 */
+    g_session = s;
+    shsh_cmd_wait = srv_cmd_wait;
+    shsh_job_wait = srv_job_wait;
+
     *out = s;
     return 0;
 }
 
-int session_run(session_t *s)
+/* 会话事件循环的驱动体。
+ * block=true ：空闲态——循环处理事件直到命令源就绪或会话停止；
+ * block=false：运行态——处理一轮事件即返回，供 shell 层前台等待重试。 */
+static void session_drive(session_t *s, bool block)
 {
     struct epoll_event events[EPOLL_MAX_EVENTS];
-    while (!s->stopping) {
+    do {
         int n = epoll_wait(s->epoll_fd, events, EPOLL_MAX_EVENTS, -1);
         if (n < 0) {
             if (errno == EINTR)
@@ -1489,12 +931,9 @@ int session_run(session_t *s)
             if (fd == s->sig_fd) {
                 struct signalfd_siginfo si;
                 while (read(s->sig_fd, &si, sizeof si) == sizeof si) {
-                    if (si.ssi_signo == SIGINT || si.ssi_signo == SIGTERM) {
+                    if (si.ssi_signo == SIGTERM)
                         session_shutdown(s, "会话已结束");
-                        break;
-                    }
-                    if (si.ssi_signo == SIGCHLD)
-                        on_child_exit(s);
+                    /* SIGCHLD：丢弃，由 shell 层 wait3 自行 reap */
                 }
                 continue;
             }
@@ -1544,21 +983,65 @@ int session_run(session_t *s)
                 }
             }
         }
+    } while (block && !s->stopping && !have_pending_cmd(s));
+}
+
+/* ---- shell 层钩子 ---- */
+
+/* 空闲态：shell 需要下一条命令时调用。同步驱动会话事件循环，直到把一行
+ * 普通命令写入命令管道（0）或会话停止（-1）。 */
+static int srv_cmd_wait(int fd)
+{
+    session_t *s = g_session;
+    if (!s || fd != s->cmd_pipe[0])
+        return -1;
+    s->running = false;
+    for (;;) {
+        if (s->stopping)
+            return -1;
+        if (s->user_dirty) {
+            s->user_dirty = false;
+            update_user(s);
+        }
+        if (deliver_lines(s))
+            return 0;
+        if (have_pending_cmd(s))
+            return 0;
+        cmd_read_arm(s);
+        session_drive(s, true);
+        cmd_read_disarm(s);
     }
-    flush_all(s);
-    return 0;
+}
+
+/* 运行态：shell 前台等待作业时调用。处理一轮会话事件（drain pty 输出、
+ * 服务客户端把执行者输入写 master），随即返回让 shell 重试 wait3。 */
+static void srv_job_wait(void)
+{
+    session_t *s = g_session;
+    if (!s || s->stopping)
+        return;
+    s->running = true;
+    session_drive(s, false);
 }
 
 void session_free(session_t *s)
 {
+    if (g_session == s) {
+        g_session = NULL;
+        shsh_cmd_wait = NULL;
+        shsh_job_wait = NULL;
+    }
     while (s->clients)
         client_disconnect(s, s->clients, false);
     kill_foreground_job(s);
-    sh_program_free(&s->cur_prog);
     unlink(s->sockpath);
     close(s->listen_fd);
     close(s->epoll_fd);
     close(s->sig_fd);
+    if (s->cmd_pipe[0] >= 0)
+        close(s->cmd_pipe[0]);
+    if (s->cmd_pipe[1] >= 0)
+        close(s->cmd_pipe[1]);
     if (s->pty_master >= 0)
         close(s->pty_master);
     if (s->pty_slave >= 0)

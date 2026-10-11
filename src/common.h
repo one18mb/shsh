@@ -23,6 +23,10 @@ char *xstrdup(const char *s);
 /* 会话名/用户名合法性：1..64 字节，仅 [A-Za-z0-9._-] */
 bool sh_name_valid(const char *s);
 
+/* 日志输出 fd。默认 stderr；shshd 在把 fd2 改指共享 pty 前会保存原始
+ * stderr 到这里，使会话层日志不混入广播给用户的共享流。 */
+extern int shsh_log_fd;
+
 void log_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void fatal(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
