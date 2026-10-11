@@ -1549,6 +1549,11 @@ setprompt(int which)
 		out2str(getprompt(NULL));
 		popstackmark(&smark);
 	}
+#ifdef SHSH_EMBED
+	/* 提示符经 pty master 由会话层广播：立即刷出输出缓冲，否则会滞留到
+	 * 下一次带换行的输出才可见，提示符出现滞后（会话层的空闲检测依赖它） */
+	flushall();
+#endif
 }
 
 const char *

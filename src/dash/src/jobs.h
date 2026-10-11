@@ -114,6 +114,11 @@ int stoppedjobs(void);
  * 等待处改为"非阻塞 reap + 调用钩子同步驱动会话 epoll"，保持单线程同步
  * 语义（见 jobs.c waitproc）。未设置（NULL）时回落原生阻塞 wait。 */
 extern void (*shsh_job_wait)(void);
+
+/* 当前前台作业的进程组（pipeline 首进程 pid；0=无）。会话层据此对 ^C
+ * （SIGINT）与执行者掉线（SIGHUP）执行整组 kill——shsh 不做 tcsetpgrp，
+ * 终端不携带该信息，故由 shell 层在 waitforjob 前后维护。 */
+extern pid_t shsh_fg_pgid;
 #endif
 
 #if ! JOBS

@@ -35,6 +35,10 @@
  * 变成对会话事件循环的同步驱动，单线程、不异步。 */
 extern int (*shsh_cmd_wait)(int);
 extern void (*shsh_job_wait)(void);
+/* 当前前台作业进程组（定义在 dash 层 jobs.c，见 jobs.h）：^C/HUP 整组 kill */
+extern pid_t shsh_fg_pgid;
+/* 上一条命令的退出状态（dash 层 error.c 的 exitstatus）：RUN_END 携带 */
+extern int exitstatus;
 
 typedef struct client {
     int fd;
@@ -64,8 +68,8 @@ struct session {
     int cmd_pipe[2];
     bool slave_armed;   /* pty slave 是否已注册进 epoll */
     bool running;       /* 前台命令执行中（两个钩子切换，供 ^C/相位判断） */
+    bool phase_run;     /* 已发 RUN_BEGIN、尚未发 RUN_END（相位，见 §3.6） */
     bool user_dirty;    /* 运行态发生的执行权变更，待空闲时注入 SHSH_USER */
-    pid_t cur_pgid;     /* 当前前台进程组（^C/HUP 用；由 shell 层回填） */
     client_t *clients;  /* 按连接顺序，头部 = 最早加入 */
     uint32_t next_id;
     uint32_t executor_id;
@@ -242,6 +246,30 @@ static void broadcast_role(session_t *s)
     buf_free(&m.payload);
 }
 
+/* RUN_BEGIN/RUN_END 相位（见 dash_decision.md 3.6）：普通行交付执行时
+ * 广播 RUN_BEGIN；shell 回到空闲（下一条命令等待）时携状态广播 RUN_END。 */
+static void run_begin(session_t *s)
+{
+    if (s->phase_run)
+        return;
+    s->phase_run = true;
+    msg_t m;
+    msg_make_run_begin(&m);
+    broadcast_msg(s, &m);
+    buf_free(&m.payload);
+}
+
+static void run_end(session_t *s, int status)
+{
+    if (!s->phase_run)
+        return;
+    s->phase_run = false;
+    msg_t m;
+    msg_make_run_end(&m, status);
+    broadcast_msg(s, &m);
+    buf_free(&m.payload);
+}
+
 /* ---- 断开 ---- */
 
 static bool flush_out(session_t *s, client_t *c)
@@ -351,8 +379,8 @@ static void pty_read_all(session_t *s)
 /* 挂断当前前台进程组（执行者掉线 / 会话结束） */
 static void kill_foreground_job(session_t *s)
 {
-    if (s->running && s->cur_pgid > 0)
-        kill(-s->cur_pgid, SIGHUP);
+    if (s->running && shsh_fg_pgid > 0)
+        kill(-shsh_fg_pgid, SIGHUP);
 }
 
 /* ---- 会话内 help（由会话层直接打印） ---- */
@@ -532,6 +560,7 @@ static bool deliver_lines(session_t *s)
             return true;
         }
         /* 普通行（含空行）：交给 shell 解析执行 */
+        run_begin(s);
         inject_line(s, line);
         inject_line(s, "\n");
         return true;
@@ -599,8 +628,8 @@ static void handle_raw(session_t *s, client_t *c, const msg_t *m)
         }
         if (ch == 0x03) {
             /* ^C：仅执行者在命令运行中中断前台组，人留下；其余忽略 */
-            if (c->id == s->executor_id && s->running && s->cur_pgid > 0)
-                kill(-s->cur_pgid, SIGINT);
+            if (c->id == s->executor_id && s->running && shsh_fg_pgid > 0)
+                kill(-shsh_fg_pgid, SIGINT);
             continue;
         }
         if (c->id == s->executor_id)
@@ -996,6 +1025,8 @@ static int srv_cmd_wait(int fd)
     if (!s || fd != s->cmd_pipe[0])
         return -1;
     s->running = false;
+    /* 回到空闲：上一条命令已结束，携其状态收尾上一相位 */
+    run_end(s, exitstatus);
     for (;;) {
         if (s->stopping)
             return -1;

@@ -94,6 +94,8 @@ pid_t backgndpid;
 /* 作业等待钩子（见 jobs.h）：由会话层设置，前台等待期间同步驱动会话事件
  * 循环；NULL 时 waitproc 走原生阻塞 wait。 */
 void (*shsh_job_wait)(void) = NULL;
+/* 当前前台作业的进程组（见 jobs.h）：waitforjob 前后维护，供会话层 ^C/HUP */
+pid_t shsh_fg_pgid = 0;
 #endif
 
 #if JOBS
@@ -908,6 +910,16 @@ static void forkchild(struct job *jp, union node *n, int mode)
 			sh_open(_PATH_DEVNULL, O_RDONLY, 0);
 		}
 	}
+#ifdef SHSH_EMBED
+	/* shsh：shell 层以 iflag=0 运行，原生仅交互态才复位前台子进程信号，
+	 * 否则子进程会继承 shell 的捕获/忽略处置——若启动环境已把 SIGINT
+	 * 置为忽略，会话层 ^C 的 kill(-pgid, SIGINT) 将被屏蔽。这里独立于
+	 * 上方 jobctl 分支，对非后台子进程复位为终端默认语义。 */
+	if (mode != FORK_BG && !oldlvl) {
+		signal(SIGINT, SIG_DFL);
+		signal(SIGQUIT, SIG_DFL);
+	}
+#endif
 	if (!oldlvl && iflag) {
 		setsignal(SIGINT);
 		setsignal(SIGQUIT);
@@ -1028,7 +1040,15 @@ waitforjob(struct job *jp)
 	int st;
 
 	TRACE(("waitforjob(%%%d) called\n", jp ? jobno(jp) : 0));
+#ifdef SHSH_EMBED
+	/* 前台作业期间暴露进程组给会话层（^C/HUP 整组 kill）；pipeline 组
+	 * 即首进程 pid（forkchild/forkparent 以此 setpgid） */
+	shsh_fg_pgid = jp ? jp->ps[0].pid : 0;
+#endif
 	dowait(jp ? DOWAIT_BLOCK : DOWAIT_NONBLOCK, jp);
+#ifdef SHSH_EMBED
+	shsh_fg_pgid = 0;
+#endif
 	if (!jp)
 		return exitstatus;
 
