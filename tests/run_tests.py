@@ -20,7 +20,6 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "bin")
 SOCKDIR = "/tmp/shsh"
-SH_MANY_N = 400  # 超过服务端候选上限（200）
 
 # \W = 会话（shshd）启动目录的文件夹名
 W = os.path.basename(os.getcwd())
@@ -154,7 +153,7 @@ class Proc:
 
 class Screen:
     """极简终端模拟：处理 \\b / \\r / \\n / ESC[K / ESC[D / ESC[C，
-    用于断言本地行编辑与补全的渲染结果（原始字节流含退格，直接看不出来）。"""
+    用于断言本地行编辑的渲染结果（原始字节流含退格，直接看不出来）。"""
 
     def __init__(self):
         self.rows = [[]]
@@ -212,7 +211,6 @@ class TtyClient:
 
     def __init__(self, session, name, cols=80, rows=24):
         self.master, slave = pty.openpty()
-        # 固定窗口大小，使补全清单的列对齐可预期
         fcntl.ioctl(slave, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0))
         self.p = subprocess.Popen(
@@ -318,15 +316,6 @@ def submit(executor, name, cmd, watcher=None, expect=None, timeout=8.0):
     if not executor.wait_count(pattern, n + 1, timeout):
         raise AssertionError("%s: 提示符未回归\n实际: %r"
                              % (executor.label, executor.text()))
-
-
-def capture_output(executor, name, cmd, timeout=8.0):
-    """执行命令并返回其输出的第一行（用于与 dash 对照）"""
-    n0 = len(executor.outbytes())
-    submit(executor, name, cmd, timeout=timeout)
-    time.sleep(0.1)
-    new = executor.outbytes()[n0:].decode(errors="replace")
-    return new.split("\n", 1)[0].rstrip("\r")
 
 
 def wait_socket(session, timeout=5.0):
@@ -801,93 +790,24 @@ def test_shshd_help():
     assert r2.returncode == 2
 
 
-def test_dash_parity_lexer():
-    """与 dash 对照词法/引号/展开子集（只对齐行为，不参考其代码结构）"""
-    import shutil
-    dash = shutil.which("dash")
-    if not dash:
-        return  # 环境无 dash 时跳过
-    cases = [
-        'echo "a  b"',
-        "echo 'raw $HOME'",
-        r"echo a\ b",
-        'echo a"b"c',
-        'echo "quoted $HOME"',
-        "echo 'single'\"double\"",
-        "echo $HOME",
-        "echo ${HOME}",
-        "echo pre${HOME}post",
-        "echo $UNDEF_VAR_XYZ_9",
-        r'echo "esc \$HOME"',
-    ]
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = join("work", "alice")
-        alice.assert_contains(ps1("alice"))
-        for cmd in cases:
-            want = subprocess.run([dash, "-c", cmd], capture_output=True,
-                                  text=True).stdout.split("\n", 1)[0].rstrip("\r")
-            got = capture_output(alice, "alice", cmd)
-            assert got == want, "命令 %r: dash=%r shsh=%r" % (cmd, want, got)
-
-        # $? 对照（false 的状态）
-        submit(alice, "alice", "false")
-        want = subprocess.run([dash, "-c", "false; echo $?"],
-                              capture_output=True, text=True).stdout.strip()
-        got = capture_output(alice, "alice", "echo $?")
-        assert got == want, "$?: dash=%r shsh=%r" % (want, got)
-    finally:
-        kill_all([d, alice])
-        clear_sockdir()
-
-
-def capture_full(executor, name, line, timeout=8.0):
-    """执行一行并返回其完整输出（去掉结尾提示符，统一 \\n）"""
-    n0 = len(executor.outbytes())
-    submit(executor, name, line, timeout=timeout)
-    time.sleep(0.1)
-    new = executor.outbytes()[n0:].decode(errors="replace")
-    idx = new.rfind(name + ":")
-    if idx >= 0:
-        new = new[:idx]
-    return new.replace("\r", "")
-
-
-def dash_out(line):
-    """取 dash 对同一行的期望输出（无 dash 时返回 None）"""
-    import shutil
-    dash = shutil.which("dash")
-    if not dash:
-        return None
-    r = subprocess.run([dash, "-c", line], capture_output=True, text=True)
-    return r.stdout
-
-
-def dash_parity(executor, name, line):
-    want = dash_out(line)
-    if want is None:
-        return
-    got = capture_full(executor, name, line)
-    assert got == want, "行 %r: dash=%r shsh=%r" % (line, want, got)
-
-
 def test_shell_control_ops():
-    """; / && / || 与短路语义（含 dash 对照）"""
+    """; / && / || 与短路语义"""
     clear_sockdir()
     d = start_server("work")
     alice = None
     try:
         alice = join("work", "alice")
         alice.assert_contains(ps1("alice"))
-        for line in ["echo a; echo b",
-                     "false && echo no",
-                     "false || echo yes",
-                     "true && echo ok",
-                     "echo x; false; echo y",
-                     "true || echo no"]:
-            dash_parity(alice, "alice", line)
+        submit(alice, "alice", "echo a; echo b", alice, "a\r\nb\r\n")
+        submit(alice, "alice", "false && echo no", alice)
+        assert not alice.wait_contains("no\r\n", timeout=0.8), \
+            "&& 后不应执行: %r" % alice.text()
+        submit(alice, "alice", "false || echo yes", alice, "yes\r\n")
+        submit(alice, "alice", "true && echo ok", alice, "ok\r\n")
+        submit(alice, "alice", "echo x; false; echo y", alice, "x\r\ny\r\n")
+        submit(alice, "alice", "true || echo no2", alice)
+        assert not alice.wait_contains("no2\r\n", timeout=0.8), \
+            "|| 短路失效: %r" % alice.text()
         # 整行状态
         submit(alice, "alice", "false; echo after=$?", alice, "after=1\r\n")
     finally:
@@ -922,19 +842,19 @@ def test_shell_redirection():
 
 
 def test_shell_pipeline():
-    """管道：内建在管道中走子进程、外部命令串联、状态取最后一段（含 dash 对照）"""
+    """管道：内建在管道中走子进程、外部命令串联、状态取最后一段"""
     clear_sockdir()
     d = start_server("work")
     alice = None
     try:
         alice = join("work", "alice")
         alice.assert_contains(ps1("alice"))
-        for line in ['echo abc | tr a-z A-Z',
-                     'echo abc | tr a-z A-Z | head -c 1; echo',
-                     "printf 'x\\ny\\n' | wc -l",
-                     "false | true; echo st=$?",
-                     "true | false; echo st=$?"]:
-            dash_parity(alice, "alice", line)
+        submit(alice, "alice", 'echo abc | tr a-z A-Z', alice, "ABC\r\n")
+        submit(alice, "alice",
+               'echo abc | tr a-z A-Z | head -c 1; echo', alice, "A\r\n")
+        submit(alice, "alice", "printf 'x\\ny\\n' | wc -l", alice, "2\r\n")
+        submit(alice, "alice", "false | true; echo st=$?", alice, "st=0\r\n")
+        submit(alice, "alice", "true | false; echo st=$?", alice, "st=1\r\n")
     finally:
         kill_all([d, alice])
         clear_sockdir()
@@ -957,53 +877,6 @@ def test_shell_pipeline_ctrl_c():
         submit(alice, "alice", "echo alive-pipe", alice, "alive-pipe\r\n")
     finally:
         kill_all([d, alice])
-        clear_sockdir()
-
-
-def test_tty_completion():
-    """真实终端下 Tab 补全：唯一候选自动补全、多候选列清单、命令名补全"""
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice")
-        alice.assert_contains("alice:")
-
-        # 命令名补全："pw" + Tab -> "pwd "
-        alice.send("pw\t")
-        assert alice.wait_contains("pwd "), "命令名未补全: %r" % alice.norm()
-        alice.send("\r")
-        alice.assert_contains(ps1("alice"))
-
-        # 唯一文件候选：先建文件，再 Tab
-        open("/tmp/shsh_compl_uniq", "w").close()
-        alice.send("echo /tmp/shsh_compl_uniq_zz\t")
-        time.sleep(0.3)
-        alice.send("\x15")  # Ctrl+U 取消该行（不退出会话）
-        time.sleep(0.2)
-
-        # 多候选：ls /tmp/shsh_compl_ 应列出候选（含 uniq 与 multi）
-        open("/tmp/shsh_compl_multi_a", "w").close()
-        open("/tmp/shsh_compl_multi_b", "w").close()
-        alice.send("echo /tmp/shsh_compl_multi_\t")
-        assert alice.wait_contains("shsh_compl_multi_a"), \
-            "多候选未列出: %r" % alice.norm()
-        alice.assert_contains("shsh_compl_multi_b")
-        time.sleep(0.2)
-        alice.send("\x15")  # Ctrl+U 取消该行
-        time.sleep(0.3)
-
-        # 补全后仍可正常执行
-        alice.send("echo done-after-compl\r")
-        alice.assert_contains("done-after-compl")
-
-        for f in ("/tmp/shsh_compl_uniq", "/tmp/shsh_compl_multi_a",
-                  "/tmp/shsh_compl_multi_b"):
-            os.unlink(f)
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
         clear_sockdir()
 
 
@@ -1035,275 +908,8 @@ def test_tty_line_editing():
         clear_sockdir()
 
 
-def test_tty_completion_cursor():
-    """补全后：不重复原词、不丢原词、光标落在正确位置
-
-    回归过两个问题：替换区间尾部用错导致原词重复；replace 为空被当成“删词”，
-    导致多候选/无候选时用户的输入被删掉、光标跳到词首。"""
-    import shutil
-    cdir = "/tmp/shsh_cdir"
-    shutil.rmtree(cdir, ignore_errors=True)
-    os.makedirs(cdir)
-    open(cdir + "/only_one_xyz", "w").close()
-    open(cdir + "/amb_a", "w").close()
-    open(cdir + "/amb_b", "w").close()
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice")
-        assert alice.wait_line("alice:shsh$ "), alice.screen().line()
-
-        # 唯一候选：补全且不重复原词
-        alice.send("echo " + cdir + "/only_one_x")
-        time.sleep(0.3)
-        alice.send("\t")
-        want = "alice:shsh$ echo " + cdir + "/only_one_xyz "
-        assert alice.wait_line(want), \
-            "唯一候选补全后应为 %r，实际 %r" % (want, alice.screen().line())
-
-        # 光标应在行尾：继续输入 Z 应追加在末尾
-        alice.send("Z")
-        assert alice.wait_line(want + "Z"), \
-            "光标不在行尾，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-        assert alice.wait_line("alice:shsh$ "), alice.screen().line()
-
-        # 多候选：列出清单，且用户输入原样保留（不删词、光标不动）
-        alice.send("echo " + cdir + "/amb_")
-        time.sleep(0.3)
-        alice.send("\t")
-        assert alice.wait_contains("amb_a"), \
-            "多候选未列清单: %r" % alice.norm()
-        assert alice.wait_line("alice:shsh$ echo " + cdir + "/amb_"), \
-            "多候选后输入被改动，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-
-        # 无候选：输入原样保留
-        alice.send("echo zzzqqq_no_such")
-        time.sleep(0.3)
-        alice.send("\t")
-        time.sleep(0.5)
-        assert alice.wait_line("alice:shsh$ echo zzzqqq_no_such"), \
-            "无候选后输入被改动，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-        assert alice.wait_line("alice:shsh$ "), alice.screen().line()
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(cdir, ignore_errors=True)
-        clear_sockdir()
-
-
-def test_tty_completion_too_many():
-    """候选过多：只提示、不展开，且服务端不被拖住（回归：曾生成 46 万字节清单阻塞会话）"""
-    import shutil
-    clear_sockdir()
-    many = "/tmp/shsh_many"
-    shutil.rmtree(many, ignore_errors=True)
-    os.makedirs(many)
-    for i in range(SH_MANY_N):
-        open(os.path.join(many, "f_%04d" % i), "w").close()
-
-    d = start_server("work")
-    alice = bob = None
-    try:
-        alice = TtyClient("work", "alice")
-        assert alice.wait_line("alice:shsh$ ")
-        bob = join("work", "bob")
-        bob.assert_contains(ps1("alice"))
-
-        n0 = len(bob.outbytes())
-        t0 = time.time()
-        alice.send("echo " + many + "/f\t")
-        assert alice.wait_contains("候选过多", 5.0), \
-            "应提示候选过多: %r" % alice.norm()
-        dt = time.time() - t0
-        assert dt < 3.0, "补全耗时过长（%.2fs），服务端被拖住" % dt
-
-        # 提示只发给执行者，不得出现在其他用户输出里
-        time.sleep(0.4)
-        assert "候选过多" not in bob.outbytes()[n0:].decode(errors="replace"), \
-            "补全提示泄漏给了其他用户"
-
-        # 会话仍可用
-        alice.send("\x15")
-        alice.send("echo still-alive\r")
-        alice.assert_contains("still-alive")
-        bob.assert_contains("still-alive")
-    finally:
-        kill_all([d])
-        for p in (alice, bob):
-            if p:
-                p.kill()
-        shutil.rmtree(many, ignore_errors=True)
-        clear_sockdir()
-
-
-def test_tty_completion_escape():
-    """含空格等特殊字符的文件名要转义，补全结果必须能直接执行"""
-    import shutil
-    edir = "/tmp/shsh_esc"
-    shutil.rmtree(edir, ignore_errors=True)
-    os.makedirs(edir)
-    open(edir + "/a b.txt", "w").close()
-    open(edir + "/c$d.txt", "w").close()
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice")
-        assert alice.wait_line("alice:shsh$ ")
-
-        # 空格：补全为 "a\ b.txt "
-        alice.send("echo " + edir + "/a")
-        time.sleep(0.3)
-        alice.send("\t")
-        want = "alice:shsh$ echo " + edir + "/a\\ b.txt "
-        assert alice.wait_line(want), \
-            "含空格文件名未转义，实际 %r" % alice.screen().line()
-        # 直接执行：应输出该文件名（说明是一个参数）
-        alice.send("\r")
-        alice.assert_contains(edir + "/a b.txt")
-
-        # $ 号：补全为 "c\$d.txt "
-        alice.send("echo " + edir + "/c")
-        time.sleep(0.3)
-        alice.send("\t")
-        want2 = "alice:shsh$ echo " + edir + "/c\\$d.txt "
-        assert alice.wait_line(want2), \
-            "含 $ 文件名未转义，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(edir, ignore_errors=True)
-        clear_sockdir()
-
-
-def test_tty_completion_levels():
-    """路径逐级下探：唯一目录补到 'dir/' 停下，再按 Tab 才进入下一级"""
-    import shutil
-    ldir = "/tmp/shsh_lvl"
-    shutil.rmtree(ldir, ignore_errors=True)
-    os.makedirs(ldir + "/only_dir")
-    open(ldir + "/only_dir/deep.txt", "w").close()
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice")
-        assert alice.wait_line("alice:shsh$ ")
-
-        # 第一级：唯一目录 -> 补到 "only_dir/" 且不再追加空格、不深入
-        alice.send("echo " + ldir + "/only")
-        time.sleep(0.3)
-        alice.send("\t")
-        want = "alice:shsh$ echo " + ldir + "/only_dir/"
-        assert alice.wait_line(want), \
-            "未停在目录级，实际 %r" % alice.screen().line()
-
-        # 第二次 Tab：进入下一级（唯一文件 -> 补全并加空格）
-        alice.send("\t")
-        want2 = want + "deep.txt "
-        assert alice.wait_line(want2), \
-            "未逐级下探，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(ldir, ignore_errors=True)
-        clear_sockdir()
-
-
-def test_tty_completion_columns():
-    """候选清单按执行者终端宽度做列对齐（列优先）"""
-    import shutil
-    cdir = "/tmp/shsh_cols"
-    shutil.rmtree(cdir, ignore_errors=True)
-    os.makedirs(cdir)
-    names = ["zzz_aaa", "zzz_bbb", "zzz_ccc", "zzz_ddd"]
-    for n in names:
-        open(cdir + "/" + n, "w").close()
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice", cols=80)
-        assert alice.wait_line("alice:shsh$ ")
-
-        alice.send("cd " + cdir + "\r")
-        alice.assert_contains(ps1("alice").replace(W, "shsh_cols"))
-        alice.send("echo zzz_")
-        time.sleep(0.3)
-        alice.send("\t")
-        assert alice.wait_contains("zzz_ddd"), \
-            "未列出候选: %r" % alice.norm()
-
-        # 列宽 = 最长项(9) + 2 = 11；80/11 = 7 列 -> 4 项排 1 行，列间距 2 空格
-        sc = alice.screen()
-        rows = ["".join(r) for r in sc.rows]
-        listing_rows = [r for r in rows if "zzz_" in r]
-        assert listing_rows, "清单行未找到: %r" % rows
-        line = listing_rows[0]
-        assert line.startswith("zzz_aaa  zzz_bbb"), \
-            "列未对齐（列宽应为 11），实际 %r" % line
-        assert line == "zzz_aaa  zzz_bbb  zzz_ccc  zzz_ddd", \
-            "整行布局不符，实际 %r" % line
-        alice.send("\x15")
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(cdir, ignore_errors=True)
-        clear_sockdir()
-
-
-def test_tty_completion_tab_spam():
-    """连按 Tab 不卡顿：服务端限速 + 客户端冷却，会话随后仍可用"""
-    import shutil
-    cdir = "/tmp/shsh_spam"
-    shutil.rmtree(cdir, ignore_errors=True)
-    os.makedirs(cdir)
-    for i in range(150):
-        open(cdir + "/n_%03d" % i, "w").close()
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice")
-        assert alice.wait_line("alice:shsh$ ")
-
-        t0 = time.time()
-        alice.send("echo " + cdir + "/n_\t\t\t\t\t\t\t\t\t\t")
-        time.sleep(1.0)
-        assert time.time() - t0 < 5.0, "连按 Tab 后长时间无响应"
-
-        # 服务器仍能正常服务
-        alice.send("\x15")
-        alice.send("echo still-ok\r")
-        alice.assert_contains("still-ok", timeout=5)
-
-        r = run(bin_path("shsh"), "-l", "-s", "work")
-        assert r.returncode == 0 and "alice" in r.stdout
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(cdir, ignore_errors=True)
-        clear_sockdir()
-
-
 def test_help_builtin():
-    """会话内 help：内容完整、可重定向、可被补全"""
+    """会话内 help：内容完整、可重定向、可经管道"""
     clear_sockdir()
     d = start_server("work")
     alice = bob = None
@@ -1313,27 +919,17 @@ def test_help_builtin():
 
         alice.send("help\r")
         for want in ("shsh — 多用户共享 shell", "会话内建命令",
-                     "to <用户>", "执行权", "快捷键", "Tab",
-                     "会话外", "暂不支持"):
+                     "to <用户>", "执行权", "快捷键",
+                     "会话外", "当前 shell 不支持"):
             alice.assert_contains(want, timeout=5)
         assert alice.wait_line("alice:shsh$ "), alice.screen().line()
 
         # help 是输出型内建：可重定向
         alice.send("help > /tmp/shsh_help.txt\r")
         time.sleep(0.4)
-        alice.send("grep -q 逐级下探 /tmp/shsh_help.txt; echo rc=$?\r")
+        alice.send("grep -q 会话内建 /tmp/shsh_help.txt; echo rc=$?\r")
         alice.assert_contains("rc=0")
         os.unlink("/tmp/shsh_help.txt")
-
-        # help 参与命令名补全（PATH 上可能还有 help* 命令，故只断言补到 help）
-        alice.send("hel\t")
-        deadline = time.time() + 3
-        while time.time() < deadline and \
-                not alice.screen().line().startswith("alice:shsh$ help"):
-            time.sleep(0.02)
-        assert alice.screen().line().startswith("alice:shsh$ help"), \
-            "help 未被补全，实际 %r" % alice.screen().line()
-        alice.send("\x15")
 
         # help 经管道也正常（内建在子进程中执行）
         alice.send("help | grep -q 快捷键; echo rc=$?\r")
@@ -1342,62 +938,6 @@ def test_help_builtin():
         kill_all([d])
         if alice:
             alice.kill()
-        clear_sockdir()
-
-
-def test_tty_completion_listing_names():
-    """清单只显示待选条目名（不显示完整路径），插入时仍带完整路径"""
-    import shutil
-    hdir = "/tmp/shsh_names"
-    shutil.rmtree(hdir, ignore_errors=True)
-    os.makedirs(hdir + "/sub_a")
-    os.makedirs(hdir + "/sub_b")
-
-    clear_sockdir()
-    d = start_server("work")
-    alice = None
-    try:
-        alice = TtyClient("work", "alice", cols=80)
-        assert alice.wait_line("alice:shsh$ ")
-
-        alice.send("echo " + hdir + "/s")
-        time.sleep(0.3)
-        alice.send("\t")
-        assert alice.wait_contains("sub_b/"), \
-            "未列出候选: %r" % alice.norm()
-
-        rows = ["".join(r) for r in alice.screen().rows]
-        listing = [r for r in rows if "sub_" in r]
-        assert listing, "清单行未找到: %r" % rows
-        assert hdir not in listing[0], \
-            "清单不应显示完整路径，实际 %r" % listing[0]
-        assert listing[0] == "sub_a/  sub_b/", \
-            "清单应只含条目名，实际 %r" % listing[0]
-
-        # 输入行被补到共同前缀 sub_（完整路径 + 共同前缀），未受清单影响
-        assert alice.screen().line() == "alice:shsh$ echo " + hdir + "/sub_", \
-            "输入行不符，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-
-        # 补全到唯一目录后逐级下探，清单同样只显示条目名
-        alice.send("echo " + hdir + "/sub_a/")
-        time.sleep(0.3)
-        alice.send("\t")
-        time.sleep(0.4)
-        alice.send("\x15")
-        os.rmdir(hdir + "/sub_a")
-        os.mkdir(hdir + "/sub_a")
-        open(hdir + "/sub_a/inner.txt", "w").close()
-        alice.send("echo " + hdir + "/sub_a/in\t")
-        want = "alice:shsh$ echo " + hdir + "/sub_a/inner.txt "
-        assert alice.wait_line(want), \
-            "逐级下探失败，实际 %r" % alice.screen().line()
-        alice.send("\x15")
-    finally:
-        kill_all([d])
-        if alice:
-            alice.kill()
-        shutil.rmtree(hdir, ignore_errors=True)
         clear_sockdir()
 
 

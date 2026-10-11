@@ -11,7 +11,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <termios.h>
-#include <time.h>
 
 /* 终端模式 */
 typedef enum {
@@ -30,23 +29,12 @@ static buf_t ed_line;
 static size_t ed_pos;
 static bool ed_on;      /* 本地行编辑中（tty + 执行者空闲） */
 static bool ed_ready;   /* 行已按回车，等待提交 */
-static bool ed_want;    /* 请求补全 */
-static bool ed_await;   /* 已发出补全请求，等待应答 */
 static bool ed_quit;    /* 需要离开会话 */
 static bool ed_inited;
-static long long ed_await_t0;    /* 补全请求发出时刻（ms） */
 
 static void ed_reset(void);
 static int write_all(int fd, const void *p, size_t n);
 static void ed_feed(const uint8_t *p, size_t n);
-static void ed_apply_complete(const uint8_t *p, size_t n);
-
-static long long mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 static void restore_tio(void)
 {
@@ -54,11 +42,10 @@ static void restore_tio(void)
         tcsetattr(STDIN_FILENO, TCSADRAIN, &g_saved);
 }
 
-/* ---- 执行者空闲时的本地行编辑与 Tab 补全 ----
+/* ---- 执行者空闲时的本地行编辑 ----
  *
- * 执行者空闲时客户端把本地终端设为原始模式，自己回显与编辑；这样 Tab 才能
- * 作为按键被截获。补全候选由服务端计算（会话 cwd / PATH 在服务端），应答只
- * 发给请求者，因此清单不会打扰其他用户。 */
+ * 执行者空闲时客户端把本地终端设为原始模式，自己回显与编辑；
+ * 提交前的输入不共享，回车后命令行才发送给服务端。 */
 
 static void ed_write(const char *p, size_t n)
 {
@@ -135,8 +122,6 @@ static void ed_reset(void)
     buf_clear(&ed_line);
     ed_pos = 0;
     ed_ready = false;
-    ed_want = false;
-    ed_await = false;
 }
 
 /* 处理原始按键 */
@@ -164,10 +149,6 @@ static void ed_feed(const uint8_t *p, size_t n)
         if (c == '\r' || c == '\n') {
             ed_write("\n", 1);
             ed_ready = true;
-            return;
-        }
-        if (c == '\t') {
-            ed_want = true;
             return;
         }
         if (c == 0x7f || c == 0x08) {
@@ -201,58 +182,6 @@ static void ed_feed(const uint8_t *p, size_t n)
     }
 }
 
-/* 应用服务端补全应答：prompt / replace_from / replace_text / listing */
-static void ed_apply_complete(const uint8_t *p, size_t n)
-{
-    size_t off = 0;
-    const uint8_t *prompt = NULL, *repl = NULL, *listing = NULL;
-    size_t plen = 0, rlen = 0, llen = 0;
-    uint32_t from = 0;
-    if (proto_get_blob(p, n, &off, &prompt, &plen) ||
-        proto_get_u32(p, n, &off, &from) ||
-        proto_get_blob(p, n, &off, &repl, &rlen) ||
-        proto_get_blob(p, n, &off, &listing, &llen)) {
-        ed_await = false;
-        return;
-    }
-
-    if (from == 0xFFFFFFFFu) { /* 服务端限速：忽略本次，不改动输入 */
-        ed_await = false;
-        return;
-    }
-
-    /* 被替换区间是 [from, cursor)：尾部要从 cursor 起，否则会把原词重复一遍 */
-    size_t old_pos = ed_pos;
-    if (from > old_pos)
-        from = (uint32_t)old_pos;
-    size_t tail_off = old_pos;
-
-    buf_t nb;
-    buf_init(&nb);
-    buf_append(&nb, ed_line.data, from);
-    buf_append(&nb, repl, rlen);
-    buf_append(&nb, ed_line.data + tail_off, ed_line.len - tail_off);
-    buf_free(&ed_line);
-    ed_line = nb;
-    ed_pos = from + rlen;
-
-    /* 只用物理回退（不能调 ed_move：它会一并改写 ed_pos，覆盖刚算好的逻辑光标） */
-    for (size_t i = 0; i < old_pos; i++)
-        ed_write("\b", 1);
-    ed_write("\x1b[K", 3);
-    if (llen) {
-        /* 清单必须先换行输出，然后重画提示符与整行 */
-        ed_write("\r\n", 2);
-        ed_write((const char *)listing, llen);
-        ed_write((const char *)prompt, plen);
-    }
-    /* 提示符已在屏幕上（未换行时）或刚写出（换行后），只画行内容 */
-    ed_write((const char *)ed_line.data, ed_line.len);
-    for (size_t i = ed_pos; i < ed_line.len; i++)
-        ed_write("\b", 1);
-    ed_await = false;
-}
-
 static void apply_mode(cmode_t m)
 {
     if (m == g_mode)
@@ -273,7 +202,7 @@ static void apply_mode(cmode_t m)
         t.c_oflag |= (OPOST | ONLCR); /* 保留输出换行处理，避免阶梯显示 */
         ed_on = false;
     } else {
-        /* 执行者空闲：原始模式 + 自己回显，才能截获 Tab 做补全 */
+        /* 执行者空闲：原始模式 + 自己回显，提交前输入不共享 */
         cfmakeraw(&t);
         t.c_oflag |= (OPOST | ONLCR);
         ed_on = true;
@@ -441,9 +370,9 @@ int client_join(const char *session, const char *name)
 
         /* 已提交命令行但服务端尚未回应前，暂停读取 stdin；
          * 运行相位中不门控（按键需直通 pty，Ctrl+C 才能中断命令） */
-        bool gate_stdin = (pending_line && g_mode != M_RUN) || ed_await;
+        bool gate_stdin = pending_line && g_mode != M_RUN;
 
-        /* 行编辑器就绪：提交；Tab：请求补全 */
+        /* 行编辑器就绪：提交 */
         if (ed_on && ed_ready && !pending_line) {
             msg_t lm;
             msg_make_line(&lm, ed_line.data, ed_line.len);
@@ -453,21 +382,6 @@ int client_join(const char *session, const char *name)
             ed_ready = false;
             buf_clear(&ed_line);
             ed_pos = 0;
-        }
-        if (ed_on && ed_want && !pending_line && !ed_await) {
-            ed_want = false;
-            /* 串行化：同一时刻只允许一个补全请求在飞（连按 Tab 只在回来后再发一次） */
-            ed_await = true;
-            ed_await_t0 = mono_ms();
-            buf_t req;
-            buf_init(&req);
-            proto_put_blob(&req, ed_line.data, ed_line.len);
-            proto_put_u32(&req, (uint32_t)ed_pos);
-            msg_t cm;
-            cm.type = C2S_COMPLETE;
-            cm.payload = req;
-            send_frame(fd, &cm);
-            buf_free(&cm.payload);
         }
         if (ed_quit && !quit_sent) {
             ed_quit = false;
@@ -495,13 +409,7 @@ int client_join(const char *session, const char *name)
             np = 3;
         }
 
-        /* 等待补全应答时周期性醒来，避免应答丢失后输入被永久门控 */
-        long long now_ms = mono_ms();
         int wait_ms = welcome ? -1 : 10000;
-        if (ed_await) {
-            long long left = 2000 - (now_ms - ed_await_t0);
-            wait_ms = left > 0 ? (int)left : 1;
-        }
         int pr = poll(pfds, (nfds_t)np, wait_ms);
         if (pr < 0) {
             if (errno == EINTR)
@@ -514,8 +422,6 @@ int client_join(const char *session, const char *name)
                 rc = 1;
                 break;
             }
-            if (ed_await && mono_ms() - ed_await_t0 >= 2000)
-                ed_await = false; /* 应答超时：解除门控，避免输入卡死 */
             continue;
         }
 
@@ -634,10 +540,6 @@ int client_join(const char *session, const char *name)
                     }
                     break;
                 }
-                case S2C_COMPLETE:
-                    msg_parse_bytes(&m, &data, &len);
-                    ed_apply_complete(data, len);
-                    break;
                 case S2C_BYE: {
                     char reason[128] = "";
                     msg_parse_text(&m, reason, sizeof reason);

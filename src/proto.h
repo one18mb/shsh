@@ -7,28 +7,25 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 消息类型。M0 已实现的：HELLO/QUIT/LIST/WELCOME/NOTICE/LISTRESP/BYE；
- * 其余为 M1+ 预留，保证协议稳定。 */
+/* 消息类型 */
 enum {
     /* C -> S */
     C2S_HELLO = 1,
-    C2S_LINE,    /* M2 */
-    C2S_RAW,     /* M1 */
-    C2S_WINCH,   /* M4 */
+    C2S_LINE,
+    C2S_RAW,
+    C2S_WINCH,
     C2S_QUIT,
     C2S_LIST,
-    C2S_COMPLETE, /* 补全请求：line + cursor */
     /* S -> C */
     S2C_WELCOME = 64,
-    S2C_OUT,       /* M1 */
-    S2C_CMD_ECHO,  /* M1 */
-    S2C_RUN_BEGIN, /* M1 */
-    S2C_RUN_END,   /* M1 */
-    S2C_ROLE,      /* M1 */
+    S2C_OUT,
+    S2C_CMD_ECHO,
+    S2C_RUN_BEGIN,
+    S2C_RUN_END,
+    S2C_ROLE,
     S2C_NOTICE,
     S2C_LISTRESP,
     S2C_BYE,
-    S2C_COMPLETE, /* 补全应答：prompt + 替换区间 + 清单 */
 };
 
 typedef struct {

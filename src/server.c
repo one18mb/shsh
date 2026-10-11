@@ -2,7 +2,6 @@
 #include "buf.h"
 #include "common.h"
 #include "exec.h"
-#include "compl.h"
 #include "parse.h"
 #include "proto.h"
 #include "pty.h"
@@ -40,8 +39,6 @@ typedef struct client {
     bool out_armed;  /* epoll 已注册 EPOLLOUT */
     bool dead;
     uint16_t rows, cols;
-    long long compl_last_ms; /* 最近一次补全请求时刻 */
-    double compl_tokens;     /* 补全令牌桶（突发 20，速率 20/s） */
     buf_t in, out;
     struct client *next;
 } client_t;
@@ -536,7 +533,6 @@ static const char *sh_help_text =
     "  执行者离开或掉线时，执行权自动移交给最早加入的在线用户。\n"
     "\n"
     "快捷键（执行者）：\n"
-    "  Tab                  补全（命令名 / 路径 / $变量；目录可逐级下探）\n"
     "  ← →  Ctrl+A / Ctrl+E 行内移动\n"
     "  Ctrl+U               清空当前行\n"
     "  Ctrl+C / Ctrl+D      离开会话（命令运行中 Ctrl+C 为中断该命令）\n"
@@ -547,8 +543,8 @@ static const char *sh_help_text =
     "  shsh -s <会话> -n <用户名>   加入会话\n"
     "  shshd <会话>         启动会话\n"
     "\n"
-    "暂不支持：通配符、$(...)、前缀赋值、&/作业控制、if/for/while 等复合语句；\n"
-    "需要时可用 sh -c '...'。\n";
+    "当前 shell 不支持：通配符、$(...)、前缀赋值、&/作业控制、\n"
+    "if/for/while 等复合语句；需要时可用 sh -c '...'。\n";
 
 static void cmd_help(session_t *s, int out_fd)
 {
@@ -1119,88 +1115,6 @@ static void process_line(session_t *s, client_t *c, const uint8_t *data,
     exec_advance(s); /* fork 路径由 SIGCHLD 继续推进 */
 }
 
-/* 补全请求：候选来自服务端状态（会话 cwd / PATH），应答只发给请求者 */
-static long long mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static void send_empty_complete(session_t *s, client_t *c)
-{
-    buf_t out;
-    buf_init(&out);
-    char ps1[512];
-    compose_ps1(s, ps1, sizeof ps1);
-    proto_put_blob(&out, ps1, strlen(ps1));
-    proto_put_u32(&out, 0xFFFFFFFFu); /* 忽略标记：客户端不得改动输入 */
-    proto_put_blob(&out, "", 0);
-    proto_put_blob(&out, "", 0);
-    msg_t r;
-    r.type = S2C_COMPLETE;
-    r.payload = out;
-    send_msg(s, c, &r, false);
-    buf_free(&r.payload);
-}
-
-static void handle_complete(session_t *s, client_t *c, const msg_t *m)
-{
-    /* 限速（令牌桶）：补全是同步计算，需防持续猛刷拖住事件循环。
-     * 允许突发 20 次（正常连按 Tab、逐级下探都够用），持续速率 20/s。 */
-    long long now = mono_ms();
-    if (c->compl_last_ms) {
-        double refill = (double)(now - c->compl_last_ms) * 0.02;
-        c->compl_tokens += refill;
-        if (c->compl_tokens > 20.0)
-            c->compl_tokens = 20.0;
-    }
-    c->compl_last_ms = now;
-    if (c->compl_tokens < 1.0) {
-        send_empty_complete(s, c);
-        return;
-    }
-    c->compl_tokens -= 1.0;
-
-    const uint8_t *p = m->payload.data;
-    size_t n = m->payload.len;
-    size_t off = 0;
-    const uint8_t *line = NULL;
-    size_t llen = 0;
-    uint32_t cursor = 0;
-    if (proto_get_blob(p, n, &off, &line, &llen) ||
-        proto_get_u32(p, n, &off, &cursor))
-        return;
-    char *ln = xmalloc(llen + 1);
-    memcpy(ln, line, llen);
-    ln[llen] = '\0';
-
-    compl_t cl;
-    size_t wstart = 0;
-    buf_t repl, listing;
-    buf_init(&repl);
-    buf_init(&listing);
-    compl_compute(ln, cursor, s->cwd, c->cols, &cl, &wstart, &repl, &listing);
-    compl_free(&cl);
-
-    buf_t out;
-    buf_init(&out);
-    char ps1[512];
-    compose_ps1(s, ps1, sizeof ps1);
-    proto_put_blob(&out, ps1, strlen(ps1));
-    proto_put_u32(&out, (uint32_t)wstart);
-    proto_put_blob(&out, repl.data, repl.len);
-    proto_put_blob(&out, listing.data, listing.len);
-    msg_t r;
-    r.type = S2C_COMPLETE;
-    r.payload = out;
-    send_msg(s, c, &r, false);
-    buf_free(&r.payload);
-    buf_free(&repl);
-    buf_free(&listing);
-    free(ln);
-}
-
 static void handle_line(session_t *s, client_t *c, const msg_t *m)
 {
     if (!c->has_name || c->id != s->executor_id || s->running) {
@@ -1252,7 +1166,6 @@ static void handle_winch(session_t *s, client_t *c, const msg_t *m)
         return;
     c->rows = rows;
     c->cols = cols;
-    c->compl_tokens = 20.0;
     if (c->has_name && c->id == s->executor_id && rows > 0 && cols > 0)
         pty_set_size(s->pty_master, rows, cols);
 }
@@ -1290,7 +1203,6 @@ static void handle_hello(session_t *s, client_t *c, const msg_t *m)
     c->id = s->next_id++;
     c->rows = rows;
     c->cols = cols;
-    c->compl_tokens = 20.0;
     snprintf(c->name, sizeof c->name, "%s", name);
 
     bool took_over = false;
@@ -1360,10 +1272,6 @@ static void dispatch(session_t *s, client_t *c, const msg_t *m)
         break;
     case C2S_LIST:
         handle_list(s, c);
-        break;
-    case C2S_COMPLETE:
-        if (c->has_name && c->id == s->executor_id)
-            handle_complete(s, c, m);
         break;
     default:
         break;

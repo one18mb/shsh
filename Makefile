@@ -3,7 +3,7 @@ CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 CPPFLAGS += -Isrc -D_GNU_SOURCE
 
 COMMON = src/common.c src/buf.c src/proto.c src/parse.c
-SRVLIB = src/pty.c src/exec.c src/compl.c
+SRVLIB = src/pty.c src/exec.c
 HDRS   = src/common.h src/buf.h src/proto.h
 
 BIN = bin/shshd bin/shsh
