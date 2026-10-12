@@ -7,6 +7,78 @@
 shsh 解决的问题是「**共享**」——会话、执行权、广播、终端角色都围绕多用户
 设计；命令本身由一个普通 shell 执行层处理，语义与普通 shell 一致。
 
+## 构建与安装
+
+```bash
+make                  # 产物在 bin/{shsh,shshd}
+make test             # 运行测试（可选）
+
+make install          # 安装到 /usr/local/bin（需相应权限）
+make uninstall        # 卸载
+```
+
+安装位置可用标准变量调整：
+
+```bash
+make install PREFIX=$HOME/.local                     # 用户级安装
+make install DESTDIR=/tmp/stage PREFIX=/usr          # 打包/暂存到指定根
+make uninstall PREFIX=$HOME/.local
+```
+
+其它目标：`make debug`（无优化带调试信息）、`make asan` / `make test-asan`
+（AddressSanitizer/UBSan 构建与测试，产物在独立的 `bin-asan/`）、
+`make clean`。
+
+## 快速开始
+
+```bash
+# 终端 A：启动会话（省略会话名时为默认 "session"；后台守护运行）
+shshd
+
+# 终端 B：alice 加入
+shsh alice
+
+# 终端 C：bob 加入（只看不能输入，执行权在 alice）
+shsh bob
+```
+
+## 使用
+
+```bash
+shshd [session]                # 启动会话（省略时默认 "session"；后台守护，kill 结束整个会话）
+shsh -l [session]              # 列出所有活动会话，或指定会话的在线用户
+shsh <name> [session]          # 加入共享会话（省略会话名时为默认 "session"）
+shsh -h                        # 帮助
+```
+
+会话内：
+
+```
+to <name>     # 转交执行权
+to shshd      # 交还系统（自动再转给最早加入的用户）
+exit          # 离开会话（挂断当前前台作业；同 Ctrl+D）
+```
+
+`shsh -l` 输出示例：
+
+```
+session1
+活动用户:
+alice
+所有用户:
+shshd alice bob
+
+session2
+活动用户:
+alice
+所有用户:
+shshd alice bob
+```
+
+- **活动用户**：当前持有执行权的用户（无人加入时为 `shshd`）。
+- **所有用户**：shshd 系统用户 + 该会话内全部在线用户。
+- 多个会话之间空一行。
+
 ## 核心概念
 
 以下七条是 shsh 独有的特性集合：没有它们就不是 shsh。
@@ -113,65 +185,6 @@ shshd 从外部 `kill`）。运行态把 ^D 交给前台后，若前台不读 st
 - `name`：当前执行者（系统持有时显示 `shshd`）
 - `\W`：会话当前工作目录的文件夹名
 
-## 构建与安装
-
-```bash
-make                  # 产物在 bin/{shsh,shshd}
-make test             # 运行测试（可选）
-
-make install          # 安装到 /usr/local/bin（需相应权限）
-make uninstall        # 卸载
-```
-
-安装位置可用标准变量调整：
-
-```bash
-make install PREFIX=$HOME/.local                     # 用户级安装
-make install DESTDIR=/tmp/stage PREFIX=/usr          # 打包/暂存到指定根
-make uninstall PREFIX=$HOME/.local
-```
-
-其它目标：`make debug`（无优化带调试信息）、`make asan` / `make test-asan`
-（AddressSanitizer/UBSan 构建与测试，产物在独立的 `bin-asan/`）、
-`make clean`。
-
-## 使用
-
-```bash
-shshd [session]                # 启动会话（省略时默认 "session"；后台守护，kill 结束整个会话）
-shsh -l [session]              # 列出所有活动会话，或指定会话的在线用户
-shsh <name> [session]          # 加入共享会话（省略会话名时为默认 "session"）
-shsh -h                        # 帮助
-```
-
-会话内：
-
-```
-to <name>     # 转交执行权
-to shshd      # 交还系统（自动再转给最早加入的用户）
-exit          # 离开会话（挂断当前前台作业；同 Ctrl+D）
-```
-
-`shsh -l` 输出示例：
-
-```
-session1
-活动用户:
-alice
-所有用户:
-shshd alice bob
-
-session2
-活动用户:
-alice
-所有用户:
-shshd alice bob
-```
-
-- **活动用户**：当前持有执行权的用户（无人加入时为 `shshd`）。
-- **所有用户**：shshd 系统用户 + 该会话内全部在线用户。
-- 多个会话之间空一行。
-
 ## Shell 语义
 
 除会话控制命令（`to` / `exit`）外，输入由会话内的 shell 执行层处理，
@@ -208,6 +221,17 @@ C11，仅依赖 Linux（epoll + PTY + AF_UNIX），两个二进制：
 
 ```bash
 make            # 发布版（-O2，零警告）
-make debug      # ASAN/UBSAN 版
-make test       # 自动化测试
+make debug      # 无优化带调试信息
+make asan       # AddressSanitizer/UBSan 构建（bin-asan/）
+make test       # 自动化测试（70 项）
 ```
+
+## License
+
+shsh 原创部分以 **MIT License** 发布，详见 [LICENSE](LICENSE)。
+
+shsh 在单进程内整合了 [dash](https://git.kernel.org/pub/scm/utils/dash/dash.git)
+（BSD 3-Clause，与 MIT 兼容）与少量 Public Domain / GPL-2.0+ 构建期组件。
+各第三方组件的版权归属、许可条款与再分发义务见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，dash 完整许可文本见
+[licenses/dash-COPYING](licenses/dash-COPYING)。

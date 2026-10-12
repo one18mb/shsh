@@ -13,3 +13,6 @@ __pycache__/
 # 编辑器 / 系统
 *.swp
 .DS_Store
+
+# 代理 / IDE 工作目录
+.trae/
