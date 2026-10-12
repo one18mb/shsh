@@ -5,14 +5,15 @@
 static void usage(FILE *f)
 {
     fprintf(f,
-            "用法: shshd <会话名>\n"
+            "用法: shshd [会话名]\n"
             "\n"
-            "启动并持有共享会话 <会话名>（SIGTERM 结束会话）。shshd 是会话\n"
-            "首领、自建 PTY 即其控制终端；从交互 shell 启动时会自动 fork\n"
-            "守护化、转入后台运行。\n"
+            "启动并持有共享会话（省略会话名时使用默认会话 \"%s\"；\n"
+            "SIGTERM 结束会话）。shshd 是会话首领、自建 PTY 即其控制终端；\n"
+            "从交互 shell 启动时会自动 fork 守护化、转入后台运行。\n"
             "\n"
             "选项:\n"
-            "  -h, --help    显示本帮助\n");
+            "  -h, --help    显示本帮助\n",
+            SH_DEFAULT_SESSION);
 }
 
 /* 把 shell 层的 fd0/1/2 指向共享 pty 的 slave：shell 自己 fork 出的外部
@@ -46,10 +47,8 @@ int main(int argc, char **argv)
         }
         session = a;
     }
-    if (!session) {
-        usage(stderr);
-        return 2;
-    }
+    if (!session)
+        session = SH_DEFAULT_SESSION;
     if (!sh_name_valid(session)) {
         fprintf(stderr, "非法的会话名: %s\n", session);
         return 2;

@@ -250,8 +250,9 @@ class TtyClient:
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         self.p = subprocess.Popen(
-            [bin_path("shsh"), "-s", session, "-n", name],
+            [bin_path("shsh"), name, session],
             stdin=slave, stdout=slave, stderr=slave, preexec_fn=_ctty)
+        self.name = name
         os.close(slave)
         self.buf = bytearray()
         self.lock = threading.Lock()
@@ -293,7 +294,7 @@ class TtyClient:
     def assert_contains(self, text, timeout=5.0):
         if not self.wait_contains(text, timeout):
             raise AssertionError("%s(tty): 未出现 %r\n实际: %r"
-                                 % (self.p.args[3], text, self.norm()))
+                                 % (self.name, text, self.norm()))
 
     def raw(self):
         with self.lock:
@@ -431,7 +432,7 @@ def start_server(session="work"):
 
 
 def join(session, name):
-    return Proc([bin_path("shsh"), "-s", session, "-n", name], name)
+    return Proc([bin_path("shsh"), name, session], name)
 
 
 def submit(executor, name, cmd, watcher=None, expect=None, timeout=8.0):

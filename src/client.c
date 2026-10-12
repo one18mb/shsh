@@ -376,28 +376,24 @@ int client_join(const char *session, const char *name)
 
 /* ---- 列出会话 ---- */
 
-static void print_listing(const char *sess, const user_info_t *users, size_t n)
+static void print_listing(const char *sess, const user_info_t *users, size_t n,
+                          bool leading_blank)
 {
-    const char *exec = "无";
+    if (leading_blank)
+        printf("\n");
+    printf("%s\n", sess);
+    printf("活动用户:\n");
     for (size_t i = 0; i < n; i++)
-        if (users[i].is_exec) {
-            exec = users[i].name;
-            break;
-        }
-    printf("%s (执行者: %s)\n", sess, exec);
-    for (size_t i = 0; i < n; i++) {
-        bool is_sys = strcmp(users[i].name, "shshd") == 0;
-        if (is_sys)
-            printf("  %-20s [系统]%s\n", users[i].name,
-                   users[i].is_exec ? " [执行者]" : "");
-        else
-            printf("  %-20s%s\n", users[i].name,
-                   users[i].is_exec ? " [执行者]" : "");
-    }
+        if (users[i].is_exec)
+            printf("%s\n", users[i].name);
+    printf("所有用户:\n");
+    for (size_t i = 0; i < n; i++)
+        printf("%s%s", i ? " " : "", users[i].name);
+    printf("\n");
     fflush(stdout);
 }
 
-static int list_one(const char *session)
+static int list_one(const char *session, bool leading_blank)
 {
     char err[128];
     int fd = connect_session(session, err, sizeof err);
@@ -434,7 +430,7 @@ static int list_one(const char *session)
             user_info_t users[256];
             size_t n = 0;
             if (msg_parse_listresp(&fr, sess, sizeof sess, users, 256, &n) == 0)
-                print_listing(sess, users, n);
+                print_listing(sess, users, n, leading_blank);
             buf_free(&fr.payload);
             buf_free(&in);
             close(fd);
@@ -450,7 +446,7 @@ static int list_one(const char *session)
 int client_list(const char *session)
 {
     if (session) {
-        if (list_one(session) != 0) {
+        if (list_one(session, false) != 0) {
             fprintf(stderr, "会话 %s 不存在或已失效\n", session);
             return 1;
         }
@@ -487,7 +483,7 @@ int client_list(const char *session)
         size_t l = strlen(names[i]);
         memcpy(sess, names[i], l - 5);
         sess[l - 5] = '\0';
-        if (list_one(sess) == 0)
+        if (list_one(sess, found > 0) == 0)
             found++;
         else
             fprintf(stderr, "注意: %s 已失效\n", names[i]);

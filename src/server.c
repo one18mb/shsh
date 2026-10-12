@@ -499,17 +499,29 @@ static void kill_foreground_job(session_t *s)
 
 /* 把积压的用户输入尽量写入 master；写入无进展（短写/队列满/EAGAIN）即返回，
  * 余量留待会话循环下次续写。master 为非阻塞：行规程输入队列满时单次 write
- * 会短写甚至返回 0，必须循环写并保留余量，否则大块粘贴/快速输入会丢字节。 */
+ * 会短写甚至返回 0，必须循环写并保留余量，否则大块粘贴/快速输入会丢字节。
+ * 每写入一块即排空一次 master 输出（canonical+ECHO 下回显走输出队列），
+ * 让输入队列与回显队列交替腾挪——只灌输入不排空回显，内核会在队列压力下
+ * 丢输入字节。 */
+/* 每次写入 master 的最大块：小块灌入 + 立即排空回显，避免 canonical+ECHO
+ * 下回显队列跟不上而被内核丢字节（队列满时 write 返回 0，交外层轮询等待）。 */
+#define PTY_IN_WRITE_CHUNK 1024
+
 static void pty_flush_input(session_t *s)
 {
     while (s->pty_in.len > 0) {
-        ssize_t w = write(s->pty_master, s->pty_in.data, s->pty_in.len);
+        /* 写入前先排空回显/输出：保证本次 write 时回显队列为空，小块产生的
+         * 回显（<= PTY_IN_WRITE_CHUNK）不会溢出，内核也就不会丢输入字节。 */
+        pty_read_all(s);
+        size_t n = s->pty_in.len < PTY_IN_WRITE_CHUNK
+                       ? s->pty_in.len : PTY_IN_WRITE_CHUNK;
+        ssize_t w = write(s->pty_master, s->pty_in.data, n);
         if (w > 0) {
             buf_consume(&s->pty_in, (size_t)w);
             continue;
         }
         if (w == 0)
-            break;  /* 输入队列满，写入无进展 */
+            break;  /* 输入队列满，写入无进展：交外层轮询等待消费者 */
         if (errno == EINTR)
             continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -518,6 +530,7 @@ static void pty_flush_input(session_t *s)
         buf_clear(&s->pty_in);
         break;
     }
+    pty_read_all(s);   /* 收尾再排空一次 */
 }
 
 /* ---- 会话内 help（由会话层直接打印） ---- */
@@ -547,10 +560,10 @@ static const char *sh_help_text =
     "  Ctrl+D               执行者：运行态交给前台（如 EOF）、空闲态离开；非执行者：离开\n"
     "\n"
     "会话外：\n"
-    "  shsh -l              列出所有会话\n"
-    "  shsh -l -s <会话>    列出该会话的用户\n"
-    "  shsh -s <会话> -n <用户名>   加入会话\n"
-    "  shshd <会话>         启动会话\n";
+    "  shsh -l                 列出所有会话及其在线用户\n"
+    "  shsh -l <会话>          列出该会话的在线用户\n"
+    "  shsh <用户名> [会话]    加入会话（省略会话名时为默认会话）\n"
+    "  shshd [会话]            启动会话（省略会话名时为默认会话）\n";
 
 static void cmd_help(session_t *s)
 {

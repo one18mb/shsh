@@ -5,10 +5,10 @@ static void usage(FILE *f)
 {
     fprintf(f,
             "用法:\n"
-            "  shsh -l                          列出所有活动会话\n"
-            "  shsh -l -s <会话>                列出指定会话的用户\n"
-            "  shsh -s <会话> -n <用户名>       加入共享会话\n"
-            "  shsh -h                          显示本帮助\n");
+            "  shsh <用户名> [会话名]   加入共享会话（省略会话名时为 \"%s\"）\n"
+            "  shsh -l [会话名]         列出所有活动会话，或指定会话的在线用户\n"
+            "  shsh -h                  显示本帮助\n",
+            SH_DEFAULT_SESSION);
 }
 
 int main(int argc, char **argv)
@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     const char *name = NULL;
     bool list = false;
     bool help = false;
+    int npos = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -24,21 +25,29 @@ int main(int argc, char **argv)
             help = true;
         } else if (strcmp(a, "-l") == 0) {
             list = true;
-        } else if (strcmp(a, "-s") == 0) {
-            if (++i >= argc) {
-                usage(stderr);
-                return 2;
-            }
-            session = argv[i];
-        } else if (strcmp(a, "-n") == 0) {
-            if (++i >= argc) {
-                usage(stderr);
-                return 2;
-            }
-            name = argv[i];
-        } else {
+        } else if (a[0] == '-') {
+            fprintf(stderr, "未知选项: %s\n", a);
             usage(stderr);
             return 2;
+        } else if (list) {
+            /* shsh -l [会话名]：至多一个位置参数 */
+            if (session) {
+                usage(stderr);
+                return 2;
+            }
+            session = a;
+            npos++;
+        } else {
+            /* shsh <用户名> [会话名]：第一个位置参数是用户名，第二个是会话名 */
+            if (npos == 0)
+                name = a;
+            else if (npos == 1)
+                session = a;
+            else {
+                usage(stderr);
+                return 2;
+            }
+            npos++;
         }
     }
 
@@ -52,12 +61,12 @@ int main(int argc, char **argv)
     }
     if (list) {
         if (name) {
-            fprintf(stderr, "-l 模式下无需 -n\n");
+            usage(stderr);
             return 2;
         }
         return client_list(session);
     }
-    if (!session || !name) {
+    if (!name) {
         usage(stderr);
         return 2;
     }
@@ -65,5 +74,5 @@ int main(int argc, char **argv)
         fprintf(stderr, "非法的用户名: %s\n", name);
         return 2;
     }
-    return client_join(session, name);
+    return client_join(session ? session : SH_DEFAULT_SESSION, name);
 }

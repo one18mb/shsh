@@ -1,8 +1,8 @@
 # shsh (shared shell)
 
-多用户共享的 shell：`shshd <session>` 启动一个会话，其他用户用
-`shsh -s <session> -n <name>` 加入，所有人看到同一个终端、同一条命令输出，
-但同一时刻只有一个人能输入。
+多用户共享的 shell：`shshd [session]` 启动一个会话（省略会话名时为默认会话
+`session`），其他用户用 `shsh <name> [session]` 加入，所有人看到同一个终端、
+同一条命令输出，但同一时刻只有一个人能输入。
 
 shsh 解决的问题是「**共享**」——会话、执行权、广播、终端角色都围绕多用户
 设计；命令本身由一个普通 shell 执行层处理，语义与普通 shell 一致。
@@ -13,7 +13,8 @@ shsh 解决的问题是「**共享**」——会话、执行权、广播、终�
 
 ### 1. 命名会话与生命周期
 
-- 会话由 `shshd <session>` 进程持有，socket 位于 `/tmp/shsh/<session>.sock`。
+- 会话由 `shshd [session]` 进程持有（省略会话名时为默认会话 `session`），
+  socket 位于 `/tmp/shsh/<session>.sock`。
 - 最后一名用户退出后会话继续存活（空闲等待新人加入）；只有 shshd 收到
   SIGTERM（`kill`）才结束会话，并向所有在线客户端广播 BYE。
   shshd 是**会话首领**（自建 PTY 即其控制终端）；从交互 shell 启动时会
@@ -26,8 +27,9 @@ shsh 解决的问题是「**共享**」——会话、执行权、广播、终�
 - 执行者离开或掉线时，执行权自动移交给**最早加入**的在线用户。
 - `to <name>` 显式转交；`to shshd` 交还给系统，shshd 随即再转交给最早加入的
   另一个用户（没有其他用户则保持，等待新人接管）。
-- **shshd 是系统虚拟用户**：启动即占用用户名 `shshd`（不能用该名加入，
-  `shsh -l` 中列为 `[系统]`）。无人执行时执行权归 shshd，会话冻结不可输入。
+- **shshd 是系统虚拟用户**：启动即占用用户名 `shshd`（不能用该名加入），
+  在 `shsh -l` 的用户列表中始终列在首位。无人执行时执行权归 shshd，会话
+  冻结不可输入。
 
 ### 3. 单一共享输出流
 
@@ -114,10 +116,9 @@ shshd 从外部 `kill`）。运行态把 ^D 交给前台后，若前台不读 st
 ## 使用
 
 ```bash
-shshd <session>                # 启动会话（后台守护，kill 结束整个会话）
-shsh -l                        # 列出所有活动会话
-shsh -l -s <session>           # 列出指定会话的在线用户
-shsh -s <session> -n <name>    # 加入共享会话
+shshd [session]                # 启动会话（省略时默认 "session"；后台守护，kill 结束整个会话）
+shsh -l [session]              # 列出所有活动会话，或指定会话的在线用户
+shsh <name> [session]          # 加入共享会话（省略会话名时为默认 "session"）
 shsh -h                        # 帮助
 ```
 
@@ -132,11 +133,22 @@ exit          # 离开会话（挂断当前前台作业；同 Ctrl+D）
 `shsh -l` 输出示例：
 
 ```
-work (执行者: alice)
-  shshd                [系统]
-  alice                [执行者]
-  bob
+session1
+活动用户:
+alice
+所有用户:
+shshd alice bob
+
+session2
+活动用户:
+alice
+所有用户:
+shshd alice bob
 ```
+
+- **活动用户**：当前持有执行权的用户（无人加入时为 `shshd`）。
+- **所有用户**：shshd 系统用户 + 该会话内全部在线用户。
+- 多个会话之间空一行。
 
 ## Shell 语义
 

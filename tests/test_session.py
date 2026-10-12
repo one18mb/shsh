@@ -24,7 +24,7 @@ def test_stale_socket_rebuild():
     s.close()
     d = start_server("stale")
     try:
-        r = run(bin_path("shsh"), "-l", "-s", "stale")
+        r = run(bin_path("shsh"), "-l", "stale")
         assert r.returncode == 0
         assert "stale" in r.stdout
     finally:
@@ -38,7 +38,7 @@ def test_shshd_name_reserved():
     d = start_server("work")
     p = None
     try:
-        p = Proc([bin_path("shsh"), "-s", "work", "-n", "shshd"], "dup")
+        p = Proc([bin_path("shsh"), "shshd", "work"], "dup")
         rc = p.wait()
         diag = "rc=%r stderr=%r server_rc=%r server_stderr=%r" % (
             rc, p.errtext(), d.p.poll(), d.errtext())
@@ -62,16 +62,42 @@ def test_list_users():
 
         r = run(bin_path("shsh"), "-l")
         assert r.returncode == 0, r.stderr
-        assert "work" in r.stdout and "alice" in r.stdout and "bob" in r.stdout
-        assert "shshd" in r.stdout and "[系统]" in r.stdout
-        assert "[执行者]" in r.stdout
-        assert "执行者: alice" in r.stdout
+        # 新列表格式：会话名 / 活动用户 / 所有用户
+        assert "work\n活动用户:\nalice\n" in r.stdout, r.stdout
+        assert "所有用户:\nshshd alice bob\n" in r.stdout, r.stdout
 
-        r2 = run(bin_path("shsh"), "-l", "-s", "work")
+        r2 = run(bin_path("shsh"), "-l", "work")
         assert r2.returncode == 0
-        assert "shshd" in r2.stdout and "alice" in r2.stdout
+        assert "work\n活动用户:\nalice\n" in r2.stdout
+        assert "所有用户:\nshshd alice bob\n" in r2.stdout
     finally:
         kill_all([d, alice, bob])
+        clear_sockdir()
+
+
+def test_list_multiple_sessions_format():
+    """shsh -l：每个会话一块（会话名/活动用户/所有用户），块间空一行"""
+    clear_sockdir()
+    da = db = None
+    aa = bb = None
+    try:
+        da = start_server("s1")
+        db = start_server("s2")
+        aa = join("s1", "alice")
+        aa.assert_contains(ps1("alice"))
+        bb = join("s2", "bob")
+        bb.assert_contains(ps1("bob"))
+        time.sleep(0.2)
+
+        r = run(bin_path("shsh"), "-l")
+        assert r.returncode == 0, r.stderr
+        # 按名字排序：s1 在前 s2 在后，中间恰一个空行
+        expected = ("s1\n活动用户:\nalice\n所有用户:\nshshd alice\n"
+                    "\n"
+                    "s2\n活动用户:\nbob\n所有用户:\nshshd bob\n")
+        assert expected in r.stdout, repr(r.stdout)
+    finally:
+        kill_all([da, db, aa, bb])
         clear_sockdir()
 
 

@@ -12,6 +12,8 @@
 
 /* 会话/用户名的最大长度 */
 #define SH_NAME_MAX 64
+/* 未显式指定会话名时的默认会话 */
+#define SH_DEFAULT_SESSION "session"
 /* 单帧 payload 上限（1 MiB） */
 #define SH_MSG_MAX (1u << 20)
 /* socket 目录 */
