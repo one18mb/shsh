@@ -113,6 +113,28 @@ shshd 从外部 `kill`）。运行态把 ^D 交给前台后，若前台不读 st
 - `name`：当前执行者（系统持有时显示 `shshd`）
 - `\W`：会话当前工作目录的文件夹名
 
+## 构建与安装
+
+```bash
+make                  # 产物在 bin/{shsh,shshd}
+make test             # 运行测试（可选）
+
+make install          # 安装到 /usr/local/bin（需相应权限）
+make uninstall        # 卸载
+```
+
+安装位置可用标准变量调整：
+
+```bash
+make install PREFIX=$HOME/.local                     # 用户级安装
+make install DESTDIR=/tmp/stage PREFIX=/usr          # 打包/暂存到指定根
+make uninstall PREFIX=$HOME/.local
+```
+
+其它目标：`make debug`（无优化带调试信息）、`make asan` / `make test-asan`
+（AddressSanitizer/UBSan 构建与测试，产物在独立的 `bin-asan/`）、
+`make clean`。
+
 ## 使用
 
 ```bash

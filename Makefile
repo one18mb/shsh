@@ -13,6 +13,12 @@ INCS     = -Isrc -I$(BUILD)
 BUILD    ?= build
 BIN_DIR  ?= bin
 
+# ---- 安装位置（标准 DESTDIR/PREFIX） ----
+PREFIX  ?= /usr/local
+DESTDIR ?=
+BINDIR   = $(DESTDIR)$(PREFIX)/bin
+INSTALL  ?= install
+
 # ---- dash 层源码清单 ----
 DASH_C = alias arith_yacc arith_yylex cd error eval exec expand histedit \
          input jobs mail main memalloc miscbltin mystring options output \
@@ -104,6 +110,20 @@ asan:
 test: all
 	python3 tests/run_tests.py
 
+# ---- 安装 / 卸载 ----
+# make install                  -> /usr/local/bin/{shsh,shshd}
+# make install PREFIX=$HOME/.local
+# make install DESTDIR=/tmp/stage PREFIX=/usr   (打包/暂存)
+install: all
+	$(INSTALL) -d $(BINDIR)
+	$(INSTALL) -m 755 $(BIN_DIR)/shsh  $(BINDIR)/shsh
+	$(INSTALL) -m 755 $(BIN_DIR)/shshd $(BINDIR)/shshd
+	@echo "已安装: $(BINDIR)/shsh  $(BINDIR)/shshd"
+
+uninstall:
+	rm -f $(BINDIR)/shsh $(BINDIR)/shshd
+	@echo "已卸载: $(BINDIR)/shsh  $(BINDIR)/shshd"
+
 # 在 ASan 构建上跑同一套测试（SHSH_BIN_DIR 覆盖 harness 里的 BIN 目录）
 test-asan: asan
 	SHSH_BIN_DIR=$(abspath bin-asan) \
@@ -116,4 +136,4 @@ clean:
 clean-asan:
 	rm -rf build-asan bin-asan
 
-.PHONY: all debug asan test test-asan clean clean-asan
+.PHONY: all debug asan test test-asan install uninstall clean clean-asan
