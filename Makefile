@@ -8,9 +8,10 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall
 CPPFLAGS += -include src/config.h -DBSD=1 -DSHELL -DSHSH_EMBED -D_GNU_SOURCE
-INCS     = -Isrc -Ibuild
+INCS     = -Isrc -I$(BUILD)
 
-BUILD    = build
+BUILD    ?= build
+BIN_DIR  ?= bin
 
 # ---- dash 层源码清单 ----
 DASH_C = alias arith_yacc arith_yylex cd error eval exec expand histedit \
@@ -32,7 +33,7 @@ DASH_OBJS = $(addprefix $(BUILD)/,$(addsuffix .o,$(DASH_C) $(DASH_BLTIN))) $(GEN
 SRV_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf proto pty server))
 CLI_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf proto client))
 
-BIN = bin/shshd bin/shsh
+BIN = $(BIN_DIR)/shshd $(BIN_DIR)/shsh
 
 all: $(BIN)
 
@@ -80,22 +81,39 @@ $(BUILD)/%.o: $(BUILD)/%.c $(GEN_HDRS)
 
 # ---- 链接 ----
 
-bin/shshd: src/shshd.c $(SRV_OBJS) $(DASH_OBJS) $(GEN_HDRS)
-	@mkdir -p bin
+$(BIN_DIR)/shshd: src/shshd.c $(SRV_OBJS) $(DASH_OBJS) $(GEN_HDRS)
+	@mkdir -p $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(INCS) $(CFLAGS) -o $@ src/shshd.c \
 		$(SRV_OBJS) $(DASH_OBJS)
 
-bin/shsh: src/shsh.c $(CLI_OBJS)
-	@mkdir -p bin
+$(BIN_DIR)/shsh: src/shsh.c $(CLI_OBJS)
+	@mkdir -p $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(INCS) $(CFLAGS) -o $@ src/shsh.c $(CLI_OBJS)
 
 debug: CFLAGS = -g -O0 -Wall
 debug: all
 
+# ---- ASan/UBSan 构建（完全独立目录，避免与常规 build/ 混用） ----
+# 用递归 make 传入变量，使 $(BIN) 等以 asan 目录重新展开（目标专属变量
+# 无法改变已在解析期展开的先决条件表）。
+ASAN_CFLAGS = -O1 -g -Wall -fsanitize=address,undefined -fno-omit-frame-pointer
+
+asan:
+	$(MAKE) BUILD=build-asan BIN_DIR=bin-asan CFLAGS="$(ASAN_CFLAGS)" all
+
 test: all
 	python3 tests/run_tests.py
 
-clean:
-	rm -rf bin $(BUILD)
+# 在 ASan 构建上跑同一套测试（SHSH_BIN_DIR 覆盖 harness 里的 BIN 目录）
+test-asan: asan
+	SHSH_BIN_DIR=$(abspath bin-asan) \
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 \
+	python3 tests/run_tests.py
 
-.PHONY: all debug test clean
+clean:
+	rm -rf $(BIN_DIR) $(BUILD)
+
+clean-asan:
+	rm -rf build-asan bin-asan
+
+.PHONY: all debug asan test test-asan clean clean-asan
