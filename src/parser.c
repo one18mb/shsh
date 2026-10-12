@@ -49,6 +49,10 @@
 #include "output.h"
 #include "var.h"
 #include "error.h"
+#include "eval.h"
+#ifdef SHSH_EMBED
+#include "termcode.h"
+#endif
 #include "memalloc.h"
 #include "mystring.h"
 #include "alias.h"
@@ -1545,6 +1549,25 @@ setprompt(int which)
 	show = !el;
 #endif
 	if (show) {
+#ifdef SHSH_EMBED
+		/* PS1 命令边界：先输出 OSC 633 D 标记（上次退出码/执行者/cwd 基名），
+		 * 再打印可见提示符。机器客户端据此识别"回到空闲、谁是执行者"。 */
+		if (whichprompt == 1) {
+			const char *u = lookupvar("SHSH_USER");
+			const char *pwd = lookupvar("PWD");
+			const char *base = pwd;
+			if (pwd) {
+				const char *slash = strrchr(pwd, '/');
+				if (slash && slash[1])
+					base = slash + 1;
+				else if (!slash)
+					base = pwd;
+				else
+					base = "/";
+			}
+			term_mark_d(exitstatus, u ? u : "", base ? base : "");
+		}
+#endif
 		pushstackmark(&smark, stackblocksize());
 		out2str(getprompt(NULL));
 		popstackmark(&smark);

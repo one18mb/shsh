@@ -44,11 +44,9 @@ int *shsh_errno;
 /* evalstring 在 eval.c（dash 原生）：setinputstring + parsecmd + evaltree */
 int evalstring(char *s, int flags);
 
-/* shsh 提示符（见 dash_decision.md 3.2/3.6）：执行者名 + cwd 基名。dash 经
- * expandstr 做参数展开，用 PWD 的目录基名表达式（cwd 由 dash 自己维护，
- * 会话层无需跟踪）；首尾 SOH/STX 不可见 sentinel 供会话层在 master 输出流
- * 中识别提示符边界（空闲检测与提示符缓存）。 */
-#define SHSH_PS1 "\001$SHSH_USER:${PWD##*/}$ \002"
+/* 提示符：执行者名 + cwd 基名。命令边界/执行者/退出码由 OSC 633 D 标记
+ * （parser.c setprompt）承载，不再用 SOH/STX 哨兵包裹提示符。 */
+#define SHSH_PS1 "$SHSH_USER:${PWD##*/}$ "
 
 static int sh_line_exc;
 

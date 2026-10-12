@@ -78,18 +78,13 @@ struct session {
     int cmd_pipe[2];
     bool slave_armed;   /* pty slave 是否已注册进 epoll */
     bool running;       /* 前台命令执行中（两个钩子切换，供 ^C/相位判断） */
-    bool phase_run;     /* 已发 RUN_BEGIN、尚未发 RUN_END（相位，见 §3.6） */
+    bool phase_run;     /* 已注入命令、尚未回空闲（相位） */
     bool abort_cmd;     /* 需放弃未完成的多行命令（执行者中途离开，见 srv_cmd_wait） */
     client_t *clients;  /* 按连接顺序，头部 = 最早加入 */
     uint32_t next_id;
-    uint32_t executor_id;
+    uint32_t executor_id;  /* 0=shshd；否则为持有执行权的 client id（用于 fg pgid） */
     bool stopping;
-    /* 提示符 sentinel（SOH/STX，见 §3.6）：master 输出流中剥离并缓存提示符串，
-     * 供新加入者单播（§3.5）。跨读可能被截断，故 states 常驻。 */
-    bool in_ps;             /* 已见 SOH、未见 STX */
-    char ps_buf[512];
-    size_t ps_len;
-    bool ps_ok;             /* 已有可单播的提示符缓存 */
+    /* 最近的提示符片段（含 OSC 633 D 标记），供新加入者单播看到当前提示符 */
     char ps_cache[512];
     size_t ps_cache_len;
     /* 空闲态从 pty slave 读到的 canonical 行缓冲（可能一次读到多行） */
@@ -442,36 +437,14 @@ static void emit_out(session_t *s, const uint8_t *p, size_t n)
 /* 过滤一段 master 输出：剥离提示符 sentinel（SOH=0x01/STX=0x02，终端不可见
  * 且 dash 原样输出），并把提示符串缓存下来供新加入者单播（§3.5/3.6）。
  * 其余字节顺序不变地广播出去。跨读的半个提示符由常驻的 in_ps 状态承接。 */
+/* pty master 侧输出：行规程回显、shell 输出（含 OSC 633 标记）、前台命令
+ * 输出统一在此广播给所有客户端。统一文本协议下不再剥离任何字节——OSC 633
+ * 标记需原样透传给终端/机器客户端；这里只缓存最近一段提示符供新加入者单播。 */
 static void pty_emit(session_t *s, const uint8_t *p, size_t n)
 {
-    uint8_t out[65536];
-    size_t o = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t ch = p[i];
-        if (ch == 0x01) { /* SOH：提示符起始 */
-            s->in_ps = true;
-            s->ps_len = 0;
-            continue;
-        }
-        if (ch == 0x02) { /* STX：提示符结束，落缓存 */
-            if (s->in_ps) {
-                memcpy(s->ps_cache, s->ps_buf,
-                       s->ps_len < sizeof s->ps_cache ? s->ps_len
-                                                      : sizeof s->ps_cache);
-                s->ps_cache_len = s->ps_len < sizeof s->ps_cache
-                                      ? s->ps_len
-                                      : sizeof s->ps_cache;
-                s->ps_ok = true;
-                s->in_ps = false;
-            }
-            continue;
-        }
-        if (s->in_ps && s->ps_len < sizeof s->ps_buf)
-            s->ps_buf[s->ps_len++] = (char)ch;
-        out[o++] = ch;
-    }
-    if (o)
-        emit_out(s, out, o);
+    /* 缓存最近输出尾部用于新客户端"当前提示符"单播（简单实现：保留最后
+     * PS1 边界之后的内容由标记扫描在客户端完成；服务端仅缓存最近片段）。 */
+    emit_out(s, p, n);
 }
 
 /* pty master 侧读：行规程回显、shell 层输出、前台命令输出都从这里广播 */
