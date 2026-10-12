@@ -3,6 +3,7 @@ bin/
 build/
 bin-asan/
 build-asan/
+dist/
 *.o
 *.d
 

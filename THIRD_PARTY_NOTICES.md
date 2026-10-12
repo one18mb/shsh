@@ -35,3 +35,17 @@ J.T. Conklin 等贡献，声明为 **Public Domain**（见该文件头）。
 除上述组件外，shsh 的会话层、客户端、测试与构建脚本（`src/server.c`、
 `src/client.c`、`src/proto.*`、`src/pty.*`、`src/buf.*`、`src/common.*`、
 `src/shsh*.c`、`tests/`、`Makefile` 等）均为 shsh 原创代码，适用 MIT License。
+
+## 运行时系统库
+
+发布的 `shsh` / `shshd` 二进制**动态链接** GNU C Library（glibc，LGPL-2.1+），
+不静态链接、不捆绑 glibc，因此不触发 LGPL 的再链接/源码提供义务；二进制可在
+具备兼容 glibc 的 GNU/Linux 上直接运行。除此之外不依赖其它第三方库。
+
+## 二进制再分发
+
+`make install` 会把本目录下的许可材料安装到
+`$PREFIX/share/doc/shsh/`；`make bindist` 生成的二进制 tar 包同样内含
+`LICENSE`、本声明与 `licenses/dash-COPYING`，以满足上述 BSD-3-Clause 第 2 条
+（二进制再分发须随附版权与许可声明）。
+

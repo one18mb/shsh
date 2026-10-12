@@ -29,6 +29,10 @@ make uninstall PREFIX=$HOME/.local
 （AddressSanitizer/UBSan 构建与测试，产物在独立的 `bin-asan/`）、
 `make clean`。
 
+发布预编译二进制可用 `make bindist`，生成 `dist/shsh-<version>-linux-x86_64.tar.gz`
+（内含 `bin/` 与全部许可材料，解压即用；版本号取 git 标签，可用
+`make bindist VERSION=x.y.z` 覆盖）。
+
 ## 快速开始
 
 ```bash

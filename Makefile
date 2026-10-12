@@ -17,7 +17,15 @@ BIN_DIR  ?= bin
 PREFIX  ?= /usr/local
 DESTDIR ?=
 BINDIR   = $(DESTDIR)$(PREFIX)/bin
+DOCDIR   = $(DESTDIR)$(PREFIX)/share/doc/shsh
 INSTALL  ?= install
+
+# 发布版本号（默认取 git 标签；无标签时回退 dev）
+VERSION  ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
+
+# 随二进制一起分发的许可/文档材料（BSD-3-Clause 第 2 条要求二进制再分发
+# 必须随附版权与许可声明）
+LICENSE_DOCS = LICENSE THIRD_PARTY_NOTICES.md README.md
 
 # ---- dash 层源码清单 ----
 DASH_C = alias arith_yacc arith_yylex cd error eval exec expand histedit \
@@ -111,18 +119,39 @@ test: all
 	python3 tests/run_tests.py
 
 # ---- 安装 / 卸载 ----
-# make install                  -> /usr/local/bin/{shsh,shshd}
+# make install                  -> /usr/local/bin/{shsh,shshd} + 许可文档
 # make install PREFIX=$HOME/.local
 # make install DESTDIR=/tmp/stage PREFIX=/usr   (打包/暂存)
+# 二进制整合了 BSD-3-Clause 的 dash，按其第 2 条随二进制一并安装许可声明。
 install: all
-	$(INSTALL) -d $(BINDIR)
+	$(INSTALL) -d $(BINDIR) $(DOCDIR)/licenses
 	$(INSTALL) -m 755 $(BIN_DIR)/shsh  $(BINDIR)/shsh
 	$(INSTALL) -m 755 $(BIN_DIR)/shshd $(BINDIR)/shshd
-	@echo "已安装: $(BINDIR)/shsh  $(BINDIR)/shshd"
+	$(INSTALL) -m 644 $(LICENSE_DOCS) $(DOCDIR)/
+	$(INSTALL) -m 644 licenses/dash-COPYING $(DOCDIR)/licenses/
+	@echo "已安装: $(BINDIR)/{shsh,shshd}"
+	@echo "许可文档: $(DOCDIR)/"
 
 uninstall:
 	rm -f $(BINDIR)/shsh $(BINDIR)/shshd
-	@echo "已卸载: $(BINDIR)/shsh  $(BINDIR)/shshd"
+	rm -rf $(DOCDIR)
+	@echo "已卸载: $(BINDIR)/shsh  $(BINDIR)/shshd  及 $(DOCDIR)"
+
+# ---- 合规二进制分发包（供 GitHub Release 上传） ----
+# 产物 dist/shsh-<ver>-linux-x86_64.tar.gz：内含 bin/ 与全部许可材料，
+# 解压即用且满足 BSD/MIT 的二进制再分发随附声明要求。
+BINTARBALL = dist/shsh-$(VERSION)-linux-x86_64.tar.gz
+
+bindist: all
+	@rm -rf dist/shsh-$(VERSION)
+	@mkdir -p dist/shsh-$(VERSION)/bin dist/shsh-$(VERSION)/licenses
+	cp $(BIN_DIR)/shsh $(BIN_DIR)/shshd dist/shsh-$(VERSION)/bin/
+	cp $(LICENSE_DOCS) dist/shsh-$(VERSION)/
+	cp licenses/dash-COPYING dist/shsh-$(VERSION)/licenses/
+	tar -C dist -czf $(BINTARBALL) shsh-$(VERSION)
+	@rm -rf dist/shsh-$(VERSION)
+	@echo "==> $(BINTARBALL)"
+	@sha256sum $(BINTARBALL)
 
 # 在 ASan 构建上跑同一套测试（SHSH_BIN_DIR 覆盖 harness 里的 BIN 目录）
 test-asan: asan
@@ -136,4 +165,4 @@ clean:
 clean-asan:
 	rm -rf build-asan bin-asan
 
-.PHONY: all debug asan test test-asan install uninstall clean clean-asan
+.PHONY: all debug asan test test-asan install uninstall bindist clean clean-asan
