@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <poll.h>
 
 #include "shell.h"
 #include "options.h"
@@ -58,6 +59,9 @@
 #include "expand.h"
 #include "parser.h"
 #include "trap.h"
+#ifdef SHSH_EMBED
+#include "shsh_shell.h"
+#endif
 
 #undef rflag
 
@@ -148,6 +152,24 @@ readcmd(int argc, char **argv)
 	goto start;
 
 	for (;;) {
+#ifdef SHSH_EMBED
+		/* 无数据可读时让出，驱动会话事件循环（转发键入、广播回显），
+		 * 否则会话冻结。shsh_read_abort 置位则放弃本次 read。 */
+		if (shsh_read_wait) {
+			struct pollfd pf;
+			pf.fd = 0;
+			pf.events = POLLIN;
+			pf.revents = 0;
+			while (poll(&pf, 1, 0) == 0 && !shsh_read_abort) {
+				shsh_read_wait();
+				pf.revents = 0;
+			}
+			if (shsh_read_abort) {
+				status = 1;
+				goto out;
+			}
+		}
+#endif
 		switch (read(0, &c, 1)) {
 		case 1:
 			break;

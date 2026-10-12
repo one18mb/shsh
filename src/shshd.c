@@ -7,8 +7,9 @@ static void usage(FILE *f)
     fprintf(f,
             "用法: shshd <会话名>\n"
             "\n"
-            "启动并持有共享会话 <会话名>（前台运行，SIGTERM 结束会话）。\n"
-            "其他用户用 shsh -s <会话名> -n <用户名> 加入。\n"
+            "启动并持有共享会话 <会话名>（SIGTERM 结束会话）。shshd 是会话\n"
+            "首领、自建 PTY 即其控制终端；从交互 shell 启动时会自动 fork\n"
+            "守护化、转入后台运行。\n"
             "\n"
             "选项:\n"
             "  -h, --help    显示本帮助\n");

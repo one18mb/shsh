@@ -94,7 +94,8 @@ pid_t backgndpid;
 /* 作业等待钩子（见 jobs.h）：由会话层设置，前台等待期间同步驱动会话事件
  * 循环；NULL 时 waitproc 走原生阻塞 wait。 */
 void (*shsh_job_wait)(void) = NULL;
-/* 当前前台作业的进程组（见 jobs.h）：waitforjob 前后维护，供会话层 ^C/HUP */
+/* 当前前台作业的进程组（见 jobs.h）：waitforjob 前后维护，供会话层
+ * HUP（执行者掉线 / 会话关停时整组挂断） */
 pid_t shsh_fg_pgid = 0;
 #endif
 
@@ -779,8 +780,8 @@ makejob(union node *node, int nprocs)
 	memset(jp, 0, sizeof(*jp));
 #if JOBS
 #ifdef SHSH_EMBED
-	/* shsh：pipeline 与外部命令无条件独立成进程组（便于整组 ^C/HUP），
-	 * 但不接管终端（forkchild/waitforjob 中不做 tcsetpgrp）。
+	/* shsh：pipeline 与外部命令无条件独立成进程组（便于整组 ^C(VINTR)/HUP）；
+	 * 前台作业由 forkchild 经 tcsetpgrp 接管控制终端。
 	 * FORK_NOJOB（命令替换、heredoc）在 forkchild 里仍不成组。 */
 	jp->jobctl = 1;
 #else
@@ -892,12 +893,11 @@ static void forkchild(struct job *jp, union node *n, int mode)
 			pgrp = jp->ps[0].pid;
 		/* This can fail because we are doing it in the child also */
 		(void)setpgid(0, pgrp);
-#ifndef SHSH_EMBED
-		/* shsh 不接管终端：终端归会话层（pty），shell 不做前台组切换。
-		 * TSTP/TTOU 仍恢复默认，使后台组写 tty 时能被 TOSTOP 停止。 */
+		/* 前台作业接管控制终端（tcsetpgrp）：交互式子 shell/TUI 据此取得
+		 * 作业控制，^C(VINTR)/^Z 也按组投递。后台组不切前台，写 tty 时由
+		 * TOSTOP 停止。 */
 		if (mode == FORK_FG)
 			xtcsetpgrp(ttyfd, pgrp);
-#endif
 		setsignal(SIGTSTP);
 		setsignal(SIGTTOU);
 	} else
@@ -911,10 +911,9 @@ static void forkchild(struct job *jp, union node *n, int mode)
 		}
 	}
 #ifdef SHSH_EMBED
-	/* shsh：shell 层以 iflag=0 运行，原生仅交互态才复位前台子进程信号，
-	 * 否则子进程会继承 shell 的捕获/忽略处置——若启动环境已把 SIGINT
-	 * 置为忽略，会话层 ^C 的 kill(-pgid, SIGINT) 将被屏蔽。这里独立于
-	 * 上方 jobctl 分支，对非后台子进程复位为终端默认语义。 */
+	/* shsh：shell 层以 iflag=0 运行，原生仅交互态才复位前台子进程信号。
+	 * 这里对非后台子进程复位为终端默认语义，使内核 VINTR 投递的 SIGINT
+	 * 能正常终止前台作业（否则会继承 shell 的捕获处置而被吞掉）。 */
 	if (mode != FORK_BG && !oldlvl) {
 		signal(SIGINT, SIG_DFL);
 		signal(SIGQUIT, SIG_DFL);
@@ -1055,19 +1054,11 @@ waitforjob(struct job *jp)
 	st = getstatus(jp);
 #if JOBS
 	if (jp->jobctl) {
-#ifndef SHSH_EMBED
+		/* 作业结束，把控制终端交还 shell（前台组复位到 rootpid）。
+		 * 前台组被信号终止时（含内核 VINTR 投递的 SIGINT）shell 自身
+		 * 收不到该信号——前台组才是接收者——故据子进程退出状态合成
+		 * 一次 SIGINT，经 EXINT 回到提示符。 */
 		xtcsetpgrp(ttyfd, rootpid);
-		/*
-		 * This is truly gross.
-		 * If we're doing job control, then we did a TIOCSPGRP which
-		 * caused us (the shell) to no longer be in the controlling
-		 * session -- so we wouldn't have seen any ^C/SIGINT.  So, we
-		 * intuit from the subprocess exit status whether a SIGINT
-		 * occurred, and if so interrupt ourselves.  Yuck.  - mycroft
-		 */
-#endif
-		/* shsh：shell 始终持有终端、从不 tcsetpgrp；但 ^C 由会话层
-		 * kill 前台组，子进程 SIGINT 退出后仍据此合成 EXINT 回提示符。 */
 		if (jp->sigint)
 			raise(SIGINT);
 	}

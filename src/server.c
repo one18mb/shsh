@@ -23,6 +23,12 @@
 #define EPOLL_MAX_EVENTS 64
 #define CLIENT_OUT_LIMIT (1u << 20) /* 单客户端输出积压上限 */
 #define CLIENT_IN_LIMIT (SH_MSG_MAX * 4)
+/* 待写入 pty master 的用户输入上限（高水位）：达此值即暂停读客户端 socket，
+ * 由 AF_UNIX 反向施加背压（见下方读取循环与 pty_flush_input）。 */
+#define PTY_IN_HIGH_WATER (1u << 20)
+/* pty master 的 POLLOUT 恒为真（不反映 slave 侧输入队列余量），无法用作
+ * 续写唤醒；改以该周期的 epoll 超时轮询续写积压输入。 */
+#define PTY_IN_POLL_MS 10
 #define DEFAULT_ROWS 24
 #define DEFAULT_COLS 80
 
@@ -35,7 +41,8 @@
  * 变成对会话事件循环的同步驱动，单线程、不异步。 */
 extern int (*shsh_cmd_wait)(int);
 extern void (*shsh_job_wait)(void);
-/* 当前前台作业进程组（定义在 dash 层 jobs.c，见 jobs.h）：^C/HUP 整组 kill */
+/* 当前前台作业进程组（定义在 dash 层 jobs.c，见 jobs.h）：执行者掉线 / 会话
+ * 关停时整组 SIGHUP */
 extern pid_t shsh_fg_pgid;
 /* 上一条命令的退出状态（dash 层 error.c 的 exitstatus）：RUN_END 携带 */
 extern int exitstatus;
@@ -88,6 +95,10 @@ struct session {
     /* 空闲态从 pty slave 读到的 canonical 行缓冲（可能一次读到多行） */
     char cmd_buf[4096];
     size_t cmd_len;
+    /* 待写入 pty master 的用户输入：master 为非阻塞、其输入队列容量有限
+     * （约 11KB），单次写入会短写/无进展，故积压于此、在会话循环中续写，
+     * 确保大块输入不丢字节 */
+    buf_t pty_in;
 };
 
 /* 钩子无 context，经此全局取得当前会话（单会话单进程） */
@@ -100,6 +111,7 @@ static void cmd_to(session_t *s, client_t *c, const char *target);
 static void request_leave(session_t *s, client_t *c);
 static int srv_cmd_wait(int fd);
 static void srv_job_wait(void);
+static void srv_read_wait(void);
 
 /* ---- 基础工具 ---- */
 
@@ -124,6 +136,7 @@ static void discard_pending_input(session_t *s)
 {
     if (s->pty_tio_ok)
         tcflush(s->pty_slave, TCIFLUSH); /* 仅清输入半行，不丢已产生的输出 */
+    buf_clear(&s->pty_in);               /* 丢弃尚未写入 master 的输入 */
     s->cmd_len = 0;
     struct pollfd p = {.fd = s->cmd_pipe[0], .events = POLLIN};
     char buf[256];
@@ -482,6 +495,31 @@ static void kill_foreground_job(session_t *s)
         kill(-shsh_fg_pgid, SIGHUP);
 }
 
+/* ---- 用户输入写入 pty master（非阻塞，防短写丢数据） ---- */
+
+/* 把积压的用户输入尽量写入 master；写入无进展（短写/队列满/EAGAIN）即返回，
+ * 余量留待会话循环下次续写。master 为非阻塞：行规程输入队列满时单次 write
+ * 会短写甚至返回 0，必须循环写并保留余量，否则大块粘贴/快速输入会丢字节。 */
+static void pty_flush_input(session_t *s)
+{
+    while (s->pty_in.len > 0) {
+        ssize_t w = write(s->pty_master, s->pty_in.data, s->pty_in.len);
+        if (w > 0) {
+            buf_consume(&s->pty_in, (size_t)w);
+            continue;
+        }
+        if (w == 0)
+            break;  /* 输入队列满，写入无进展 */
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        /* EIO 等：master 侧已不可写，丢弃待写输入 */
+        buf_clear(&s->pty_in);
+        break;
+    }
+}
+
 /* ---- 会话内 help（由会话层直接打印） ---- */
 
 static const char *sh_help_text =
@@ -743,27 +781,25 @@ static void handle_raw(session_t *s, client_t *c, const msg_t *m)
             break;
         }
         if (ch == 0x03) {
-            /* ^C 两模式：非执行者——前台即 shsh 自身，^C=结束（离开）；
-             * 执行者运行态——raw/TUI 把 ^C 作按键交前台，否则整组 SIGINT
-             * （我们关了 ISIG，需 shshd 代发）；空闲/续行无效果。 */
+            /* ^C 两模式：非执行者——前台即 shsh 自身，^C=结束（离开）；执行者
+             * 运行态——把字节交给 pty 行规程的 VINTR，由内核按当前前台进程组
+             * 投递 SIGINT（前台程序若自行关了 ISIG，则作普通按键送达）；空闲
+             * 态无前台作业，丢弃。 */
             if (c->id != s->executor_id) {
                 leave = true;
                 break;
             }
-            if (s->running && shsh_fg_pgid > 0) {
-                struct termios t;
-                if (tcgetattr(s->pty_slave, &t) == 0 && !(t.c_lflag & ICANON))
-                    buf_append_byte(&pass, ch);
-                else
-                    kill(-shsh_fg_pgid, SIGINT);
-            }
+            if (s->running)
+                buf_append_byte(&pass, ch);
             continue;
         }
         if (c->id == s->executor_id)
             buf_append_byte(&pass, ch);
     }
-    if (pass.len)
-        (void)!write(s->pty_master, pass.data, pass.len);
+    if (pass.len) {
+        buf_append(&s->pty_in, pass.data, pass.len);
+        pty_flush_input(s);   /* 循环写，未完则留待会话循环续写（防短写丢数据） */
+    }
     buf_free(&pass);
     if (leave)
         request_leave(s, c);
@@ -957,6 +993,27 @@ int session_pty_slave(session_t *s)
     return s->pty_slave;
 }
 
+/* 让本进程成为会话首领，以便随后把 pty slave 收作控制终端（作业控制/TOSTOP/
+ * VINTR 都依赖控制终端）。从交互 shell 启动时本进程通常已是进程组组长，
+ * setsid 会返回 EPERM；此时 fork 出非组长的子进程接棒，父进程退出（守护化，
+ * 启动命令不变）。子进程是唯一继续者：pty、socket、事件循环都在其中建立。 */
+static int become_session_leader(void)
+{
+    if (setsid() >= 0)
+        return 0;               /* 直接成为会话首领 */
+    if (errno != EPERM)
+        return -1;
+    /* 已是进程组组长，无法 setsid；fork 一份在父组内的非组长子进程继续 */
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid > 0)
+        _exit(0);               /* 父进程交棒退出，子进程在后台继续服务 */
+    if (setsid() < 0)
+        return -1;
+    return 0;
+}
+
 int session_start(session_t **out, const char *name)
 {
     session_t *s = xmalloc(sizeof *s);
@@ -969,6 +1026,7 @@ int session_start(session_t **out, const char *name)
     s->cmd_pipe[0] = -1;
     s->cmd_pipe[1] = -1;
     s->executor_id = SH_EXEC_SHSHD;
+    buf_init(&s->pty_in);
 
     if (mkdir(SH_SOCK_DIR, 0777) != 0 && errno != EEXIST)
         fatal("无法创建 %s: %s", SH_SOCK_DIR, strerror(errno));
@@ -992,8 +1050,14 @@ int session_start(session_t **out, const char *name)
         log_info("清理陈旧 socket %s", s->sockpath);
     }
 
+    /* 先成会话首领、再把 pty slave 收作控制终端：作业控制、TOSTOP、
+     * ^C(VINTR) 等标准终端语义都以此为前提（见 dash_decision.md 4）。 */
+    if (become_session_leader() != 0)
+        fatal("无法成为会话首领: %s", strerror(errno));
     if (pty_open(&s->pty_master, &s->pty_slave) != 0)
         fatal("无法创建 pty: %s", strerror(errno));
+    if (pty_acquire_ctty(s->pty_slave) != 0)
+        log_error("无法取得控制终端: %s（作业控制不可用）", strerror(errno));
     s->pty_tio_ok = pty_config_shared(s->pty_slave, &s->pty_tio) == 0;
     /* slave 保持阻塞：会话层读 canonical 行、shell 层 fd0/1/2 都指向它，
      * 非阻塞会破坏 shell 的 read 内建与前台程序的行输入 */
@@ -1035,12 +1099,15 @@ int session_start(session_t **out, const char *name)
     if (epoll_ctl(s->epoll_fd, EPOLL_CTL_ADD, s->pty_master, &pev) < 0)
         fatal("epoll_ctl(pty): %s", strerror(errno));
 
-    /* 信号收编：SIGTERM 关停会话，SIGCHLD 唤醒事件循环（由 shell 层 wait3
+    /* 信号收编：SIGTERM/SIGHUP 关停会话（SIGHUP 亦会在本进程关闭 pty master
+     * 时由内核发给会话首领，必须阻塞以经 signalfd 处理，否则会以默认处置
+     * 把"正常退出"变成被信号杀死）；SIGCHLD 唤醒事件循环（由 shell 层 wait3
      * 自行 reap，会话层消费后丢弃）。SIGINT 不入掩码——它由 shell 层捕获
      * 用于中断合成与 EXINT 恢复，会话层不接管（见 dash_decision.md 3.1）。 */
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, NULL);
     s->sig_fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
@@ -1059,6 +1126,7 @@ int session_start(session_t **out, const char *name)
     g_session = s;
     shsh_cmd_wait = srv_cmd_wait;
     shsh_job_wait = srv_job_wait;
+    shsh_read_wait = srv_read_wait;
 
     *out = s;
     return 0;
@@ -1071,7 +1139,12 @@ static void session_drive(session_t *s, bool block)
 {
     struct epoll_event events[EPOLL_MAX_EVENTS];
     do {
-        int n = epoll_wait(s->epoll_fd, events, EPOLL_MAX_EVENTS, -1);
+        /* 有积压的用户输入：先尽力续写；pty master 的 POLLOUT 恒为真、不能
+         * 用作可写唤醒，故退化为按 PTY_IN_POLL_MS 超时轮询，边写边等。 */
+        if (s->pty_in.len)
+            pty_flush_input(s);
+        int timeout = s->pty_in.len ? PTY_IN_POLL_MS : -1;
+        int n = epoll_wait(s->epoll_fd, events, EPOLL_MAX_EVENTS, timeout);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -1095,7 +1168,7 @@ static void session_drive(session_t *s, bool block)
             if (fd == s->sig_fd) {
                 struct signalfd_siginfo si;
                 while (read(s->sig_fd, &si, sizeof si) == sizeof si) {
-                    if (si.ssi_signo == SIGTERM)
+                    if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGHUP)
                         session_shutdown(s, "会话已结束");
                     /* SIGCHLD：丢弃，由 shell 层 wait3 自行 reap */
                 }
@@ -1120,6 +1193,10 @@ static void session_drive(session_t *s, bool block)
                         closed = true;
                         break;
                     }
+                    /* 待写输入已达高水位：暂停读，交由 AF_UNIX 反向背压；
+                     * 余量留待 pty_in 排空后再读（fd 仍挂 EPOLLIN，会再触发） */
+                    if (s->pty_in.len >= PTY_IN_HIGH_WATER)
+                        break;
                     ssize_t r = read(c->fd, chunk, sizeof chunk);
                     if (r > 0) {
                         buf_append(&c->in, chunk, (size_t)r);
@@ -1165,6 +1242,7 @@ static int srv_cmd_wait(int fd)
      * 无法 canonical 解析（换行不认、无回显），会话像"卡住"。 */
     if (s->pty_tio_ok)
         tcsetattr(s->pty_slave, TCSANOW, &s->pty_tio);
+    shsh_read_abort = 0;   /* 清上一轮 read 的放弃标志 */
     /* 回到空闲：上一条命令已结束，携其状态收尾上一相位 */
     run_end(s, exitstatus);
     for (;;) {
@@ -1206,12 +1284,35 @@ static void srv_job_wait(void)
     }
 }
 
+/* 内建 read 阻塞等待 fd0 输入时调用（见 shsh_shell.h）：驱动一轮会话事件，
+ * 把执行者键入转发到 master、把回显/输出广播出去，然后返回让 read 重试。
+ * running 置真使会话层不抢读 slave（输入归 read 独占）。执行者掉线或会话
+ * 停止时置 shsh_read_abort，令 read 立即返回。 */
+static void srv_read_wait(void)
+{
+    session_t *s = g_session;
+    if (!s) {
+        shsh_read_abort = 1;
+        return;
+    }
+    if (s->stopping || s->abort_cmd) {
+        shsh_read_abort = 1;
+        return;
+    }
+    shsh_read_abort = 0;
+    s->running = true;
+    session_drive(s, false);
+    if (s->stopping || s->abort_cmd)
+        shsh_read_abort = 1;
+}
+
 void session_free(session_t *s)
 {
     if (g_session == s) {
         g_session = NULL;
         shsh_cmd_wait = NULL;
         shsh_job_wait = NULL;
+        shsh_read_wait = NULL;
     }
     flush_all(s); /* 关停前把排队的 BYE 送出（运行循环已不再负责 flush） */
     while (s->clients)
@@ -1229,5 +1330,6 @@ void session_free(session_t *s)
         close(s->pty_master);
     if (s->pty_slave >= 0)
         close(s->pty_slave);
+    buf_free(&s->pty_in);
     free(s);
 }

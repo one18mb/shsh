@@ -46,13 +46,20 @@ int pty_set_size(int fd, uint16_t rows, uint16_t cols)
     return ioctl(fd, TIOCSWINSZ, &ws);
 }
 
+int pty_acquire_ctty(int slave_fd)
+{
+    /* 会话首领且尚无控制终端时，把该 tty 收作本会话的控制终端。 */
+    return ioctl(slave_fd, TIOCSCTTY, 0);
+}
+
 int pty_config_shared(int slave_fd, struct termios *canon)
 {
     struct termios t;
     if (tcgetattr(slave_fd, &t) != 0)
         return -1;
-    t.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | TOSTOP;
-    t.c_lflag &= ~(ISIG);
+    /* ISIG 保持开启：^C/^Z/VINTR 等由行规程按当前前台进程组投递信号，
+     * 与标准终端一致（前台程序若自行关 ISIG，则作普通按键送达）。 */
+    t.c_lflag |= ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ISIG | TOSTOP;
     t.c_iflag |= ICRNL;  /* 客户端 CR 交付为换行 */
     if (tcsetattr(slave_fd, TCSANOW, &t) != 0)
         return -1;

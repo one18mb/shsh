@@ -29,6 +29,7 @@
 #include "var.h"
 #include "trap.h"
 #include "output.h"
+#include "jobs.h"
 #include "memalloc.h"
 #include "error.h"
 
@@ -50,6 +51,11 @@ int evalstring(char *s, int flags);
 #define SHSH_PS1 "\001$SHSH_USER:${PWD##*/}$ \002"
 
 static int sh_line_exc;
+
+/* 内建 read 的让出钩子与放弃标志（见 shsh_shell.h）：会话层在 session_start
+ * 注册/清除；read 无数据可读时经此驱动会话事件循环，避免会话冻结。 */
+void (*shsh_read_wait)(void) = NULL;
+volatile int shsh_read_abort = 0;
 
 /* 异常落点：fork 出的命令子进程继承/被重置到 main_handler，其 EV_EXIT
  * 路径会 exraise(EXEND)：子进程必须 exitshell 永不返回；只有根 shell 才
@@ -80,13 +86,14 @@ shsh_shell_init(void)
 	init();
 
 	/* 以"读标准输入的非交互 shell"为底，但提示符/输入由会话层接管：
-	 * 不打开任何脚本文件、不读 profile、不做 setjobctl（终端归会话层）。 */
+	 * 不打开任何脚本文件、不读 profile。mflag=1 表示开启作业控制（下）；
+	 * 信号/行编辑仍按非交互处理，故 iflag 保持 0。 */
 	arg0 = "shsh";
 	minusc = NULL;
 	argptr = NULL;
 	sflag = 1;
 	iflag = 0;
-	mflag = 0;
+	mflag = 1;
 	shellparam.p = NULL;
 	shellparam.nparam = 0;
 	shellparam.optind = 1;
@@ -99,6 +106,12 @@ shsh_shell_init(void)
 	/* 信号策略（见 trap.c SHSH_EMBED 分支）：SIGINT 捕获为 EXINT 回提示符；
 	 * SIGTERM/SIGQUIT 保持默认，交由 shshd 经 signalfd 收编（不忽略）。 */
 	setsignal(SIGINT);
+
+	/* 开启 shell 层作业控制：shell 自成进程组（rootpid）并持有 pty 前台组，
+	 * 前台命令执行期间把控制终端交给该组（jobs.c 的 tcsetpgrp），使交互式
+	 * 子 shell/TUI（如 bash）取得作业控制，TOSTOP 与 ^C(VINTR) 也按标准终端
+	 * 语义生效。控制终端由会话层在 session_start 里取得。 */
+	setjobctl(1);
 }
 
 /* 执行一条 canonical 行（不含结尾换行）。

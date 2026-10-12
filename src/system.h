@@ -36,7 +36,18 @@
 
 static inline void sigclearmask(void)
 {
-#if defined(HAVE_SIGSETMASK) && \
+#if defined(SHSH_EMBED)
+	/* shsh：会话层靠常驻阻塞的 SIGTERM/SIGHUP（会话关停）与 SIGCHLD
+	 * （唤醒前台等待的事件循环）经 signalfd 收编。dash 的 sigclearmask
+	 * 语义是"复位为常规空掩码"，会把它们一并解除——须保留。exec 前的
+	 * 子进程会在 exec.c 里另行清空掩码，故外部命令不受影响。 */
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGHUP);
+	sigaddset(&set, SIGCHLD);
+	sigprocmask(SIG_SETMASK, &set, 0);
+#elif defined(HAVE_SIGSETMASK) && \
     (!defined(__GLIBC__) || \
      (defined(__GNUC__) && (__GNUC__ * 1000 + __GNUC_MINOR__) >= 4006))
 #ifdef __GLIBC__

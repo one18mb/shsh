@@ -26,4 +26,13 @@ void shsh_shell_set_user(const char *name);
  * 返回最后一条命令状态；*want_exit 同 run_line 语义。 */
 int shsh_shell_run_fd(int fd, int *want_exit);
 
+/* ---- 内建 read 的让出钩子 ----
+ * 内建命令（如 read）在 fd0 上阻塞读取时不会回调会话层钩子，事件循环随之
+ * 停摆 → 会话冻结（收不到键入、也无回显）。故 read 在无数据可读时调用
+ * shsh_read_wait 让出，由会话层驱动一轮事件循环（转发键入、广播回显），
+ * 再重试；shsh_read_abort 置位表示会话层要求 read 放弃（执行者掉线/会话
+ * 停止），read 应立即返回失败。二者由会话层在 session_start 注册。 */
+extern void (*shsh_read_wait)(void);
+extern volatile int shsh_read_abort;
+
 #endif

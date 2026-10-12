@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <signal.h>
 #ifdef HAVE_PATHS_H
 #include <paths.h>
 #endif
@@ -111,6 +112,16 @@ shellexec(char **argv, const char *path, int idx)
 	int e;
 	char **envp;
 	int exerrno;
+
+#ifdef SHSH_EMBED
+	/* exec 前清除会话层保留的信号掩码（SIGTERM/SIGCHLD，见 system.h
+	 * sigclearmask），使外部命令继承常规空掩码，可被正常 kill。 */
+	{
+		sigset_t empty;
+		sigemptyset(&empty);
+		sigprocmask(SIG_SETMASK, &empty, NULL);
+	}
+#endif
 
 	envp = environment();
 	if (strchr(argv[0], '/') != NULL) {
