@@ -17,7 +17,7 @@ def test_empty_list():
 
 
 def test_missing_session():
-    r = run(bin_path("shsh"), "a", "nosuch")
+    r = run(bin_path("shsh"), "login", "-n", "a", "-s", "nosuch")
     assert r.returncode == 1
     assert "不存在" in r.stderr
 
@@ -44,7 +44,7 @@ def test_shshd_help():
 
 
 def test_default_session():
-    """shshd 省略会话名 → 默认会话 "session"；shsh <name> 省略会话名也加入它"""
+    """shshd 省略会话名 → 默认会话 "session"；shsh login 省略会话名也加入它"""
     clear_sockdir()
     d = None
     alice = None
@@ -58,3 +58,14 @@ def test_default_session():
     finally:
         kill_all([d, alice])
         clear_sockdir()
+
+
+def test_login_requires_name():
+    """login 缺 -n → 用法错误 rc=2"""
+    assert run(bin_path("shsh"), "login").returncode == 2
+
+
+def test_logout_no_endpoint():
+    """logout 无端点也应正常结束（rc=0）"""
+    r = run(bin_path("shsh"), "logout", "-n", "ghost", "-s", "nosuch")
+    assert r.returncode == 0, r.stderr

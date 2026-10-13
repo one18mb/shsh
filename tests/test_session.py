@@ -24,7 +24,7 @@ def test_stale_socket_rebuild():
     s.close()
     d = start_server("stale")
     try:
-        r = run(bin_path("shsh"), "-l", "stale")
+        r = run(bin_path("shsh"), "-l", "-s", "stale")
         assert r.returncode == 0
         assert "stale" in r.stdout
     finally:
@@ -38,7 +38,8 @@ def test_shshd_name_reserved():
     d = start_server("work")
     p = None
     try:
-        p = Proc([bin_path("shsh"), "shshd", "work"], "dup")
+        p = Proc([bin_path("shsh"), "login", "-n", "shshd", "-s", "work"],
+                 "dup")
         rc = p.wait()
         diag = "rc=%r stderr=%r server_rc=%r server_stderr=%r" % (
             rc, p.errtext(), d.p.poll(), d.errtext())
@@ -66,7 +67,7 @@ def test_list_users():
         assert "work\n活动用户:\nalice\n" in r.stdout, r.stdout
         assert "所有用户:\nshshd alice bob\n" in r.stdout, r.stdout
 
-        r2 = run(bin_path("shsh"), "-l", "work")
+        r2 = run(bin_path("shsh"), "-l", "-s", "work")
         assert r2.returncode == 0
         assert "work\n活动用户:\nalice\n" in r2.stdout
         assert "所有用户:\nshshd alice bob\n" in r2.stdout

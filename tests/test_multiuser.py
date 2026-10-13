@@ -47,9 +47,10 @@ def test_shared_output_and_echo():
         alice.send("\n")  # 提交
         bob.assert_contains("hidden\r\n")
         alice.assert_contains("hidden\r\n")
-        # 命令结束后新提示符回到两个终端
-        bob.assert_contains("hidden\r\n" + ps1("alice"))
-        alice.assert_contains("hidden\r\n" + ps1("alice"))
+        # 命令结束后新提示符回到两个终端（C/D 标记在输出与 PS1 之间，
+        # 对可见终端而言二者相邻；用剥除标记的 vtext 断言）
+        assert "hidden\n" + ps1("alice") in bob.vtext(), bob.vtext()
+        assert "hidden\n" + ps1("alice") in alice.vtext(), alice.vtext()
     finally:
         kill_all([d, alice, bob])
         clear_sockdir()

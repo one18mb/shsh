@@ -5,15 +5,16 @@
 static void usage(FILE *f)
 {
     fprintf(f,
-            "用法: shshd [会话名]\n"
+            "用法: shshd [-s 会话名]\n"
             "\n"
             "启动并持有共享会话（省略会话名时使用默认会话 \"%s\"；\n"
             "SIGTERM 结束会话）。shshd 是会话首领、自建 PTY 即其控制终端；\n"
             "从交互 shell 启动时会自动 fork 守护化、转入后台运行。\n"
             "\n"
             "选项:\n"
+            "  -s 会话名     指定会话名（默认 \"%s\"）\n"
             "  -h, --help    显示本帮助\n",
-            SH_DEFAULT_SESSION);
+            SH_DEFAULT_SESSION, SH_DEFAULT_SESSION);
 }
 
 /* 把 shell 层的 fd0/1/2 指向共享 pty 的 slave：shell 自己 fork 出的外部
@@ -36,6 +37,14 @@ int main(int argc, char **argv)
             usage(stdout);
             return 0;
         }
+        if (strcmp(a, "-s") == 0) {
+            if (++i >= argc || session) {
+                usage(stderr);
+                return 2;
+            }
+            session = argv[i];
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "未知选项: %s\n", a);
             usage(stderr);
@@ -45,7 +54,7 @@ int main(int argc, char **argv)
             usage(stderr);
             return 2;
         }
-        session = a;
+        session = a; /* 位置参数形式（兼容） */
     }
     if (!session)
         session = SH_DEFAULT_SESSION;

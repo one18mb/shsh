@@ -44,8 +44,8 @@ int *shsh_errno;
 /* evalstring 在 eval.c（dash 原生）：setinputstring + parsecmd + evaltree */
 int evalstring(char *s, int flags);
 
-/* 提示符：执行者名 + cwd 基名。命令边界/执行者/退出码由 OSC 633 D 标记
- * （parser.c setprompt）承载，不再用 SOH/STX 哨兵包裹提示符。 */
+/* 提示符：执行者名 + cwd 基名。命令边界/执行者/退出码由 setprompt 打印
+ * PS1 前发出的 OSC 633 C/D 标记承载（见 parser.c）。 */
 #define SHSH_PS1 "$SHSH_USER:${PWD##*/}$ "
 
 static int sh_line_exc;
@@ -54,6 +54,19 @@ static int sh_line_exc;
  * 注册/清除；read 无数据可读时经此驱动会话事件循环，避免会话冻结。 */
 void (*shsh_read_wait)(void) = NULL;
 volatile int shsh_read_abort = 0;
+
+/* 命令相位标志（见 shsh_shell.h）：会话层交付命令置位，parser 的 setprompt
+ * 在 PS1 处消费（先 C 后 D）。 */
+volatile int shsh_phase_run = 0;
+
+/* 排空钩子（会话层注册，见 server.c）：shell 层据此判定是否追加 P。 */
+int (*shsh_cmd_drained)(void) = NULL;
+
+void
+shsh_shell_phase_begin(void)
+{
+	shsh_phase_run = 1;
+}
 
 /* 异常落点：fork 出的命令子进程继承/被重置到 main_handler，其 EV_EXIT
  * 路径会 exraise(EXEND)：子进程必须 exitshell 永不返回；只有根 shell 才
@@ -209,8 +222,8 @@ shsh_shell_run_fd(int fd, int *want_exit)
 			continue;			/* 本行出错，继续读下一条 */
 		}
 
-		/* doprompt=1：dash 在每条命令/续行前打印 PS1/PS2，经 master 广播；
-		 * 提示符串由会话层按 sentinel 识别（3.6）。 */
+		/* doprompt=1：dash 在每条命令/续行前打印 PS1/PS2；setprompt 同时
+		 * 发出 OSC 633 C/D 标记，随后可见提示符经 master 广播全员。 */
 		n = parsecmd(1);
 		if (n == NEOF)
 			break;

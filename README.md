@@ -10,7 +10,7 @@ shsh 解决的问题是「**共享**」——会话、执行权、广播、终�
 ## 构建与安装
 
 ```bash
-make                  # 产物在 bin/{shsh,shshd}
+make                  # 产物在 bin/{shsh,shshd,send}
 make test             # 运行测试（可选）
 
 make install          # 安装到 /usr/local/bin（需相应权限）
@@ -40,19 +40,21 @@ make uninstall PREFIX=$HOME/.local
 shshd
 
 # 终端 B：alice 加入
-shsh alice
+shsh login -n alice
 
 # 终端 C：bob 加入（只看不能输入，执行权在 alice）
-shsh bob
+shsh login -n bob
 ```
 
 ## 使用
 
 ```bash
-shshd [session]                # 启动会话（省略时默认 "session"；后台守护，kill 结束整个会话）
-shsh -l [session]              # 列出所有活动会话，或指定会话的在线用户
-shsh <name> [session]          # 加入共享会话（省略会话名时为默认 "session"）
-shsh -h                        # 帮助
+shshd [-s 会话名]                         # 启动会话（省略时默认 "session"；后台守护，kill 结束整个会话）
+shsh -l [-s 会话名]                       # 列出所有活动会话，或指定会话的在线用户
+shsh login -n 用户名 [-s 会话名] [--plain] [-d]
+                                          # 加入会话；-d 为后台端点（供 send 使用）
+shsh logout -n 用户名 [-s 会话名]          # 停止该用户的端点并清理文件
+shsh -h                                   # 帮助
 ```
 
 会话内：
@@ -92,7 +94,8 @@ shshd alice bob
 - 会话由 `shshd [session]` 进程持有（省略会话名时为默认会话 `session`），
   socket 位于 `/tmp/shsh/<session>.sock`。
 - 最后一名用户退出后会话继续存活（空闲等待新人加入）；只有 shshd 收到
-  SIGTERM（`kill`）才结束会话，并向所有在线客户端广播 BYE。
+  SIGTERM（`kill`）才结束会话：向共享流写入一枚 OSC 633 `E` 标记后关闭，
+  客户端读到 EOF。
   shshd 是**会话首领**（自建 PTY 即其控制终端）；从交互 shell 启动时会
   自动 fork 脱离、作为后台守护运行。
 - 同名会话拒绝重复启动；残留的陈旧 socket 会被自动重建。
@@ -135,10 +138,32 @@ shshd alice bob
 
 角色切换时清空终端输入队列，旧输入不会被当成新角色的命令。
 
-### 5. 相位协议
+### 5. 相位协议（OSC 633 带内标记）
 
-每条命令由 `RUN_BEGIN` … `RUN_END{status}` 括起，客户端据此呈现运行/
-空闲相位、门控输入；执行权变化由 `ROLE` 推送，会话结束由 `BYE` 通知。
+shshd↔shsh 之间**只有一条文本字节流，没有私有二进制帧**：命令边界、退出码、
+执行权、会话关闭全部编码进人眼不可见的 OSC 633 序列（终止符 ST = `ESC \`），
+VS Code/iTerm2/kitty 等终端原生理解，其它终端忽略未知 OSC。标记顺序：
+
+```
+ESC ] 633 ; A ST                 命令已提交、即将执行
+…命令回显/输出…
+ESC ] 633 ; C ; <退出码> ST       命令结束（精确退出码）
+ESC ] 633 ; P ST                 命令输入已全部消费、shell 空闲（批次结束信号）
+ESC ] 633 ; Q ; <长度> ST        续行提示符(PS2)：其后为该长度的可见 PS2 文本
+ESC ] 633 ; D ; s=<退出码>;u=<执行者>;w=<目录基名> ST   提示符边界（回到空闲）
+<可见 PS1：name:dir$ >
+```
+
+- `A` 按"**每条交付的规范行**"发（含 heredoc/复合命令的续行），`C` 按"**每条
+  顶层命令结束**"发；两者数量在跨行复合命令下不相等。`P` 在"命令输入排空、
+  shell 空闲"时随 `C` 一起发出，`send` 据此精确判定一批输入已全部执行完
+  （仅按换行数凑 `C` 会对不上）。`Q` 携带 PS2 长度，`send` 据此精确抑制
+  续行提示符（`> `），只留命令输出。
+
+- 执行权变化后 shell 重打的提示符自带新 `u=`，取代独立的角色推送。
+- 会话关闭为 `ESC ] 633 ; E ; reason=<原因> ST`，随后即 EOF。
+- 机器/管道客户端从同一流解析这些标记即可切分命令；`shsh --plain` 可剥除
+  标记只留纯文本。
 
 ### 6. 会话级共享状态
 
@@ -173,7 +198,7 @@ shsh 的 shell 是**终端会话首领**，PTY 为其控制终端，作业控制
 
 两条模式源于 shsh 的同步共享原则：follower 的“前台”就是 shsh 客户端本身，
 所以 ^C/^D 结束它；执行者的前台是 shshd 手上的共享命令，所以按相位裁决。
-客户端据 ROLE 切换本地终端：**follower 保持 cooked（关回显）**，让本地系统
+客户端据最新 D 标记里的 `u=<我?>` 切换本地终端：**follower 保持 cooked（关回显）**，让本地系统
 处理 ^C/^D——因此 **shshd 卡死时 follower 也能正常退出**；**执行者用 raw**，
 ^C/^D 作为字节上送由 shshd 裁决。Ctrl+C/D 对 shshd 自身都不是信号（结束
 shshd 从外部 `kill`）。运行态把 ^D 交给前台后，若前台不读 stdin（如 `sleep`），
@@ -196,15 +221,68 @@ shshd 从外部 `kill`）。运行态把 ^D 交给前台后，若前台不读 st
 `${VAR}`、`$?`）、`;`/`&&`/`||`、管道、重定向、`cd`/`pwd`/`echo`/
 `export`/`unset` 等内建、外部命令执行。复杂语法可用 `sh -c '...'` 兜底。
 
-## 协议
+## 协议（统一文本，OSC 633）
 
-AF_UNIX 字节流，帧 = u32 BE payload 长度 + u16 BE 类型 + payload（上限
-1 MiB）。
+AF_UNIX 承载一条**双向纯文本字节流**，没有任何带外二进制帧；也可直接用
+`nc -U /tmp/shsh/<session>.sock` 调试。
 
-- C→S：`HELLO{name,rows,cols}`、`RAW`（全部键入，含 ^C/^D）、`WINCH`、
-  `LIST`
-- S→C：`WELCOME{self,exec,exec_name}`、`OUT`、`RUN_BEGIN`、
-  `RUN_END{status}`、`ROLE{exec}`、`NOTICE`、`LISTRESP`、`BYE{reason}`
+- 连接后客户端先发**首行文本握手**：`<name>\n` 加入会话；`list\n` 则做一次
+  性纯文本列表查询（服务端应答到 EOF，不属于共享终端流）。
+- 上行（shsh→shshd）：首行之后的全部字节即原始键入（含 ^C/^D），逐键透传；
+  终端尺寸夹带在流中的 `ESC ] 633 ; W ; <rows> ; x <cols> ST` 标记里，
+  shshd 剥离后转 `TIOCSWINSZ`，绝不落入 PTY 输入。
+- 下行（shshd→shsh）：终端文本 + OSC 633 标记：
+
+  | 序列 | 含义 |
+  |---|---|
+  | `ESC]633;A ST` | 命令已提交、即将执行 |
+  | `ESC]633;C;<退出码> ST` | 命令结束，携带精确退出码 |
+  | `ESC]633;P ST` | 命令输入已全部消费、shell 空闲 |
+  | `ESC]633;Q;<长度> ST` | 续行提示符(PS2)：其后为该长度的可见文本 |
+  | `ESC]633;D;s=<退出码>;u=<执行者>;w=<目录> ST` | 提示符边界/当前执行者 |
+  | `ESC]633;E;reason=<原因> ST` | 会话即将关闭，随后 EOF |
+
+  自身是否为执行者 = 比较最新 `D` 的 `u=` 与命令行给定的名字；终止信号即
+  EOF（Unix 惯例）。标记对普通终端不可见，`shsh --plain` 可剥除。
+
+## agent/脚本通道（send）
+
+`send` 把共享会话封装成**同步命令调用**，供脚本/Agent 非交互使用。关键设计：
+**shsh 是唯一的 shshd 客户端**，同时充当 send 的本地端点 —— 无论前台交互
+还是后台（`shsh login -n X -d`），shsh 都会在 `~/.shsh/` 下建立
+`<会话>__<用户>.{in,out,cursor,pid}` 通道：命令经 `.in`（FIFO，shsh 以
+`O_RDWR` 自持写端、永不 EOF）注入，shshd 输出被 shsh 原样 tee 到 `.out`。
+`send` 只做文件 I/O，不连 socket、不启动 shsh。
+
+```bash
+# 起后台端点（供 send 使用；前台交互 shsh login 同样可作为端点）
+shsh login -n alice -s work -d
+
+send -n alice -s work 'make && make test'   # 等执行权→投递→等命令结束，打印增量
+send -n alice -s work 'to bob'              # 转交执行权；在 D;u=bob 处返回
+send -n alice -s work - <<'EOF'             # 从 stdin 读多行脚本
+echo one
+echo two
+EOF
+shsh logout -n alice -s work                # 停止端点并清理文件
+```
+
+- **寻址**：`(会话, 用户名)` 是唯一键，文件即句柄；`-n/-s` 省略时取
+  `$SHSH_NAME/$SHSH_SESSION`，再退到 `~/.shsh/current`（上次成功绑定）。
+- **省 token**：默认只返回命令输出，吞掉自身提示符与命令回显；`-l` 连回显
+  一起返回。**别人的活动始终返回。**
+- **多行**：命令可含换行（多行脚本逐行执行、全部结束后返回）；参数为 `-`
+  时从 stdin 读。
+- 执行者不在自己时，`send <命令>` 会等待交权再投递；端点不存在则报错
+  （send 不负责启动 shsh，shsh 生命周期由 shsh 自己管理）。
+- 游标按 `.out` 绝对偏移推进，每次只返回上次结束后的增量，OSC 标记被剥除。
+- **输入长度**：命令参数受内核单参数上限（`MAX_ARG_STRLEN`，约 **128 KiB**）
+  限制，超出时 shell 直接报 `Argument list too long`（E2BIG）——这是内核硬限；
+  大输入请走 stdin（`send - <<EOF`），stdin 路径**无固定上限**：client 非阻塞
+  I/O + 上行缓冲、server 端以**背压**（输出积压达 1 MiB 软上限暂停读该客户端
+  输入，排空后恢复；仅 64 MiB 硬上限防失控 OOM）替代断连，端到端限流，已实测
+  4 MiB 输出平滑完成。单行仍受 pty canonical `MAX_CANON`（约 4096 字节）
+  限制，超长单行会被截断，长内容请拆多行或 `sh -c` 包裹。
 
 ## 边界
 
@@ -218,16 +296,17 @@ AF_UNIX 字节流，帧 = u32 BE payload 长度 + u16 BE 类型 + payload（上�
 
 ## 开发
 
-C11，仅依赖 Linux（epoll + PTY + AF_UNIX），两个二进制：
+C11，仅依赖 Linux（epoll + PTY + AF_UNIX），三个二进制：
 
 - `bin/shshd`：会话层（socket、执行权、广播、PTY 仲裁）+ shell 执行层
-- `bin/shsh`：客户端（raw 终端、帧收发）
+- `bin/shsh`：交互客户端，同时是 send 的本地端点（FIFO 注入 + 输出 tee + OSC 633 扫描）
+- `bin/send`：非交互 agent/脚本通道（纯文件增量客户端）
 
 ```bash
-make            # 发布版（-O2，零警告）
+make            # 发布版（-O2，自有层零警告）
 make debug      # 无优化带调试信息
 make asan       # AddressSanitizer/UBSan 构建（bin-asan/）
-make test       # 自动化测试（70 项）
+make test       # 自动化测试（87 项）
 ```
 
 ## License

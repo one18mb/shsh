@@ -113,7 +113,8 @@ onint(void) {
 	}
 #endif
 	/* shsh：主进程永不因 SIGINT 自杀（^C 是发给前台组的作业信号）；
-	 * 统一记录 128+SIGINT 并经 EXINT 回主循环，由会话层发 RUN_END。 */
+	 * 记录 128+SIGINT 并经 EXINT 回主循环；下一枚 PS1 前 setprompt 会
+	 * 据此发出携带该退出码的 OSC 633 C/D 标记。 */
 	exitstatus = SIGINT + 128;
 	exraise(EXINT);
 	/* NOTREACHED */

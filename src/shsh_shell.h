@@ -18,6 +18,19 @@ void shsh_shell_abort(void);
  * 再注入改名"产生的过渡提示符。 */
 void shsh_shell_set_user(const char *name);
 
+/* 命令相位标志：会话层每交付一条要执行的 canonical 行置 1（发 OSC 633 A）；
+ * shell 层在下一次 PS1（setprompt）处先发 C;<退出码> 再发 D，保证字节流里
+ * 标记顺序为 A → 输出 → C → D+PS1。to/exit/help 等被会话层拦截、不交给
+ * shell 执行的行不置位，故不会有无前导 A 的 C。执行者掉线 abort 回 PS1 时
+ * 标志仍在，C 携带 EXINT 的退出状态（通常 130）。 */
+extern volatile int shsh_phase_run;
+void shsh_shell_phase_begin(void);
+
+/* 排空钩子（会话层注册，见 server.c）：shell 层在 PS1 发 C 后询问"命令输入
+ * 是否已全部消费"；为真则在同一路输出里追加一枚 OSC 633 P（send 的批次结束
+ * 信号）。同路输出保证 P 排在 C 之后，无跨 fd 时序问题。 */
+extern int (*shsh_cmd_drained)(void);
+
 /* 把一个已打开的命令源 fd（通常是会话 pipe 的读端，调用方应放到 >=10
  * 以免与 shell 内部 fd 冲突）压为持久输入层，并驱动解析执行直到该 fd
  * EOF。未闭合引号/heredoc/行尾续行期间 parser 阻塞在 fd 上等后续写入，

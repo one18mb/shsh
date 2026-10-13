@@ -1550,9 +1550,12 @@ setprompt(int which)
 #endif
 	if (show) {
 #ifdef SHSH_EMBED
-		/* PS1 命令边界：先输出 OSC 633 D 标记（上次退出码/执行者/cwd 基名），
-		 * 再打印可见提示符。机器客户端据此识别"回到空闲、谁是执行者"。 */
+		/* PS1 命令边界：若上一条命令相位已交付（A 已发），先发 C;<退出码>
+		 * 收尾（顺序 A→输出→C→D），再发 D 标记（上次退出码/执行者/cwd 基名），
+		 * 然后打印可见提示符。机器客户端据此精确切分命令边界。 */
 		if (whichprompt == 1) {
+			extern volatile int shsh_phase_run;
+			extern int (*shsh_cmd_drained)(void);
 			const char *u = lookupvar("SHSH_USER");
 			const char *pwd = lookupvar("PWD");
 			const char *base = pwd;
@@ -1565,7 +1568,22 @@ setprompt(int which)
 				else
 					base = "/";
 			}
+			if (shsh_phase_run) {
+				term_mark_c(exitstatus);
+				shsh_phase_run = 0;
+				/* 命令输入已排空：追加 P（send 判定"本批输入已全部消费"）。
+				 * 与 C/D 走同一路输出，顺序天然为 ...C → P → D。 */
+				if (shsh_cmd_drained && shsh_cmd_drained())
+					term_mark("P");
+			}
 			term_mark_d(exitstatus, u ? u : "", base ? base : "");
+		} else if (whichprompt == 2) {
+			/* 续行提示符（PS2）：发 Q;<长度>（长度=其后可见 PS2 文本字节数），
+			 * 机器客户端(send)据此精确抑制这段提示符、只留命令输出（省
+			 * token）。PS2 之后紧跟的可能是命令输出，故必须给长度、不可
+			 * "抑制到下一枚标记"。 */
+			const char *p2 = getprompt(NULL);
+			term_mark_q((int)strlen(p2));
 		}
 #endif
 		pushstackmark(&smark, stackblocksize());

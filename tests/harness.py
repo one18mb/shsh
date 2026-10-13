@@ -4,14 +4,16 @@
 提供驱动真实 shshd / shsh 进程的类与工具：
   Proc        —— 子进程 + 后台 drain 线程（避免管道死锁）
   TtyClient   —— stdin/stdout 接到 pty（真实终端语义）
-  Screen      —— 极简终端模拟（行编辑渲染断言）
-  ProtoClient —— 裸 AF_UNIX 客户端，用于协议健壮性测试
+  Screen      —— 极简终端模拟（行编辑渲染断言，跳过 CSI/OSC）
+  RawClient   —— 裸 AF_UNIX 文本客户端（首行握手 + OSC 633 扫描），
+                 用于统一文本协议的健壮性用例
 以及 start_server / join / submit / wait_socket / kill_all / run 等助手。
 
 BIN 目录可用环境变量 SHSH_BIN_DIR 覆盖（供 ASan 构建复用同一套测试）。
 """
 
 import os
+import re
 import fcntl
 import pty
 import signal
@@ -27,21 +29,57 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("SHSH_BIN_DIR") or os.path.join(ROOT, "bin")
 SOCKDIR = "/tmp/shsh"
 
-# 协议常量（见 src/proto.h）
-C2S_HELLO = 1
-C2S_RAW = 2
-C2S_WINCH = 3
-C2S_LIST = 4
-S2C_WELCOME = 64
-S2C_OUT = 65
-S2C_RUN_BEGIN = 66
-S2C_RUN_END = 67
-S2C_ROLE = 68
-S2C_NOTICE = 69
-S2C_LISTRESP = 70
-S2C_BYE = 71
+# ---- 统一文本协议：OSC 633 带内标记（见 src/termcode.h） ----
+OSC = b"\x1b]633;"
+ST = b"\x1b\\"
+BEL = b"\x07"
 
-SH_MSG_MAX = 1 << 20  # 单帧 payload 上限（src/common.h）
+# 完整 633 标记：ESC ] 633 ; body (ST|BEL)；body 内不含 ESC/BEL
+MARK_RE = re.compile(rb"\x1b\]633;([^\x07\x1b]*)(?:\x1b\\|\x07)")
+# 任意 OSC 序列（含非 633，如窗口标题），用于剥成可见文本
+OSC_ANY_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x1b\\|\x07)")
+
+
+def mark(code, **fields):
+    """构造 OSC 633 标记，如 mark('D', s=0, u='alice', w='shsh')。"""
+    body = code
+    for k, v in fields.items():
+        body += ";%s=%s" % (k, v)
+    return OSC + body.encode() + ST
+
+
+def wmark(rows, cols):
+    """客户端→服务端的终端尺寸标记。"""
+    return OSC + b"W;%d;x%d" % (rows, cols) + ST
+
+
+def parse_marks(data):
+    """提取字节流里全部完整 633 标记：[(code, {字段: 字符串值})]。
+    跨读的半截标记天然匹配不到，等下一块拼齐即可。"""
+    out = []
+    for m in MARK_RE.finditer(data):
+        body = m.group(1).decode(errors="replace")
+        code = body[0] if body else ""
+        fields = {}
+        positional = []
+        for seg in body[1:].split(";"):
+            if not seg:
+                continue  # 起始分号/空段
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                fields[k] = v
+            else:
+                positional.append(seg)
+        # C 等标记的裸参数（如 C;1 的退出码）放在 fields[""] 里
+        if positional:
+            fields[""] = positional[0]
+        out.append((code, fields))
+    return out
+
+
+def strip_marks(data):
+    """剥除所有 OSC 序列，返回可见字节（CSI 等其它转义仍保留）。"""
+    return OSC_ANY_RE.sub(b"", data)
 
 # \W = 会话（shshd）启动目录的文件夹名
 W = os.path.basename(os.getcwd())
@@ -140,6 +178,13 @@ class Proc:
         with self.lock:
             return bytes(self.out).decode(errors="replace")
 
+    def vtext(self):
+        """剥除 OSC（633 标记等）后的可见文本（CR 也归一化去掉），
+        供断言"命令输出与下一枚提示符相邻"这类可见终端行为。"""
+        with self.lock:
+            return self._norm(strip_marks(bytes(self.out))).decode(
+                errors="replace")
+
     def errtext(self):
         with self.lock:
             return bytes(self.err).decode(errors="replace")
@@ -210,6 +255,16 @@ class Screen:
                     elif seq == "C":
                         self.c = min(len(self.rows[self.r]), self.c + 1)
                     continue
+                if s[i + 1:i + 2] == "]":
+                    # OSC（含 OSC 633 标记）：跳到 ST(ESC \) 或 BEL
+                    j = i + 2
+                    while j < len(s) and s[j] != "\x07":
+                        if s[j] == "\x1b" and s[j + 1:j + 2] == "\\":
+                            j += 1
+                            break
+                        j += 1
+                    i = j + 1
+                    continue
                 i += 1
                 continue
             if ch == "\r":
@@ -250,7 +305,7 @@ class TtyClient:
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
         self.p = subprocess.Popen(
-            [bin_path("shsh"), name, session],
+            [bin_path("shsh"), "login", "-n", name, "-s", session],
             stdin=slave, stdout=slave, stderr=slave, preexec_fn=_ctty)
         self.name = name
         os.close(slave)
@@ -327,11 +382,10 @@ class TtyClient:
             pass
 
 
-class ProtoClient:
-    """裸协议客户端：直接读写 AF_UNIX 套接字与 6 字节帧（u32 BE 长度 +
-    u16 BE 类型），用于注入畸形/半帧/超大帧等健壮性用例。"""
-
-    HDR = 6
+class RawClient:
+    """统一文本协议的裸 AF_UNIX 客户端：首行 name/list 握手，之后是纯键入
+    字节流；OSC 633 W 标记上报尺寸，下行流用 parse_marks 扫描。
+    用于注入半截握手/畸形名/半截标记等健壮性用例。"""
 
     def __init__(self, session, timeout=5.0):
         self.path = os.path.join(SOCKDIR, session + ".sock")
@@ -339,34 +393,60 @@ class ProtoClient:
         self.sock.settimeout(timeout)
         self.sock.connect(self.path)
         self.buf = bytearray()
+        # 唯一读套接字的后台线程（多线程并发 recv/setsockopt 会竞态）
+        self._reader_on = False
+        self._eof = False
 
-    @staticmethod
-    def frame(mtype, payload=b""):
-        if isinstance(payload, str):
-            payload = payload.encode()
-        return struct.pack("!IH", len(payload), mtype) + payload
+    def drain_start(self):
+        """启动后台持续排空（大流量用例避免客户端积压）。hello 会自动启动。"""
+        if self._reader_on:
+            return
+        self._reader_on = True
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        while True:
+            r = self._recv_some(1.0)
+            if r is None:
+                self._eof = True
+                return
+
+    def wait_closed(self, timeout=5.0):
+        """等待服务端关闭到 EOF。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._eof:
+                return True
+            if not self._reader_on:
+                self._recv_some(0.05)
+            else:
+                time.sleep(0.05)
+        return self._eof
 
     def send_raw(self, data):
+        if isinstance(data, str):
+            data = data.encode()
         self.sock.sendall(data)
 
-    def send_frame(self, mtype, payload=b""):
-        self.sock.sendall(self.frame(mtype, payload))
-
-    def hello(self, name, rows=24, cols=80):
-        nm = name.encode()
-        payload = struct.pack("!B", len(nm)) + nm + struct.pack("!HH", rows, cols)
-        self.send_frame(C2S_HELLO, payload)
+    def hello(self, name, rows=24, cols=80, drain=True):
+        """首行文本握手 + 初始尺寸标记。
+        drain=True（默认）启动后台持续读取；drain=False 时保持"不读"状态，
+        供背压用例制造客户端积压（wait_* 仍会按需短暂读取）。"""
+        self.send_raw(name.encode() + b"\n")
+        self.winch(rows, cols)
+        if drain:
+            self.drain_start()
 
     def raw_input(self, data):
         if isinstance(data, str):
             data = data.encode()
-        self.send_frame(C2S_RAW, data)
+        self.send_raw(data)
 
     def winch(self, rows, cols):
-        self.send_frame(C2S_WINCH, struct.pack("!HH", rows, cols))
+        self.send_raw(wmark(rows, cols))
 
     def list(self):
-        self.send_frame(C2S_LIST)
+        self.send_raw(b"list\n")
 
     def shutdown_write(self):
         try:
@@ -374,51 +454,122 @@ class ProtoClient:
         except OSError:
             pass
 
-    def recv_frame(self, timeout=None):
-        """返回 (type, payload)，或 None（连接关闭 / 超时 / 出错）。"""
-        if timeout is not None:
-            self.sock.settimeout(timeout)
-        while True:
-            if len(self.buf) >= self.HDR:
-                ln, typ = struct.unpack("!IH", bytes(self.buf[:self.HDR]))
-                if len(self.buf) >= self.HDR + ln:
-                    payload = bytes(self.buf[self.HDR:self.HDR + ln])
-                    del self.buf[:self.HDR + ln]
-                    return typ, payload
-            try:
-                chunk = self.sock.recv(65536)
-            except (socket.timeout, OSError):
-                return None
-            if not chunk:
-                return None
-            self.buf.extend(chunk)
-
-    def recv_until(self, mtype, timeout=5.0):
-        """读到指定类型帧返回其 payload，否则 None（超时/关闭）。"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            fr = self.recv_frame(timeout=max(0.05, deadline - time.time()))
-            if fr is None:
-                continue
-            if fr[0] == mtype:
-                return fr[1]
-        return None
-
-    def closed(self, timeout=2.0):
-        """探测连接是否被对端关闭（读到 EOF/出错即视为已关闭）。"""
-        self.sock.settimeout(timeout)
+    def _recv_some(self, timeout):
+        """读一块进 buf；False=超时，None=EOF/连接已关闭。"""
         try:
-            chunk = self.sock.recv(4096)
+            self.sock.settimeout(timeout)
+            chunk = self.sock.recv(65536)
         except socket.timeout:
             return False
         except OSError:
-            return True
+            return None
         if not chunk:
-            return True
+            return None
         self.buf.extend(chunk)
+        return True
+
+    def drain(self, seconds):
+        """持续等待 seconds 秒，返回收到的全部可见字节（EOF 提前结束）。"""
+        deadline = time.time() + seconds
+        while time.time() < deadline and not self._eof:
+            if self._reader_on:
+                time.sleep(0.05)
+            elif self._recv_some(0.05) is None:
+                break
+        return self.visible()
+
+    def gather(self, seconds=1.5, stop=None):
+        """等待若干秒；stop（字节或字符串）出现在可见输出中即提前结束。"""
+        if isinstance(stop, str):
+            stop = stop.encode()
+        deadline = time.time() + seconds
+        while time.time() < deadline and not self._eof:
+            if stop and stop in self.visible():
+                break
+            if self._reader_on:
+                time.sleep(0.05)
+            elif self._recv_some(0.05) is None:
+                break
+        return self.visible()
+
+    def visible(self):
+        """已收字节剥除全部 OSC 序列后的可见文本。"""
+        return strip_marks(bytes(self.buf))
+
+    def marks(self):
+        return parse_marks(bytes(self.buf))
+
+    def wait_mark(self, code=None, fields=None, timeout=5.0):
+        """等到匹配的 633 标记返回其字段字典；code 可传字符串/集合；
+        fields 为要求的字段子集。超时返回 None。"""
+        if isinstance(code, str):
+            codes = {code}
+        elif code is None:
+            codes = None
+        else:
+            codes = set(code)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for c, f in self.marks():
+                if codes is not None and c not in codes:
+                    continue
+                if fields and any(f.get(k) != v for k, v in fields.items()):
+                    continue
+                return f if fields is not None else (c, f)
+            if self._eof:
+                return None
+            if self._reader_on:
+                time.sleep(0.02)
+            else:
+                self._recv_some(0.05)
+        return None
+
+    def wait_visible(self, text, timeout=5.0):
+        """等待可见文本（剥除 OSC 后）包含 text。"""
+        if isinstance(text, str):
+            text = text.encode()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if text in self.visible():
+                return True
+            if self._eof:
+                return False
+            if self._reader_on:
+                time.sleep(0.02)
+            else:
+                self._recv_some(0.05)
+        return False
+
+    def recv_until_eof(self, timeout=5.0):
+        """读到 EOF，返回全部收到字节；超时返回 None。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r = self._recv_some(max(0.05, deadline - time.time()))
+            if r is None:
+                return bytes(self.buf)
+        return None
+
+    def closed(self, timeout=2.0):
+        """连接是否已被对端关闭（EOF）。后台 reader 开启时只轮询其 EOF 标志，
+        绝不与 reader 并发 recv（setsockopt/recv 竞态）。"""
+        if self._reader_on:
+            return self.wait_closed(timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(0.2)
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                return False
+            except OSError:
+                return True
+            if not chunk:
+                return True
+            self.buf.extend(chunk)
         return False
 
     def close(self):
+        self._eof = True   # 通知后台 reader 收尾，避免 EBADF 噪声
         try:
             self.sock.close()
         except OSError:
@@ -426,13 +577,13 @@ class ProtoClient:
 
 
 def start_server(session="work"):
-    d = Proc([bin_path("shshd"), session], "shshd")
+    d = Proc([bin_path("shshd"), "-s", session], "shshd")
     wait_socket(session)
     return d
 
 
 def join(session, name):
-    return Proc([bin_path("shsh"), name, session], name)
+    return Proc([bin_path("shsh"), "login", "-n", name, "-s", session], name)
 
 
 def submit(executor, name, cmd, watcher=None, expect=None, timeout=8.0):

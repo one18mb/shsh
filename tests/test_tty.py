@@ -78,7 +78,7 @@ def test_tty_line_editing():
 
 
 def test_tty_winch_resize():
-    """执行者终端 resize（SIGWINCH→C2S_WINCH）改变共享 pty 尺寸"""
+    """执行者终端 resize（SIGWINCH→OSC 633 W 标记）改变共享 pty 尺寸"""
     clear_sockdir()
     d = start_server("work")
     alice = None
@@ -86,7 +86,8 @@ def test_tty_winch_resize():
         alice = TtyClient("work", "alice", cols=80, rows=24)
         alice.assert_contains(ps1("alice"))
         # 直接改客户端 pty 的窗口尺寸：内核向前台客户端发 SIGWINCH，
-        # 客户端经 C2S_WINCH 通知服务端 TIOCSWINSZ 共享 pty
+        # 客户端把尺寸编码进流中的 OSC 633 W 标记，shshd 剥离后
+        # TIOCSWINSZ 共享 pty
         fcntl.ioctl(alice.master, termios.TIOCSWINSZ,
                     struct.pack("HHHH", 33, 100, 0, 0))
         time.sleep(0.3)

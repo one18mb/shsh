@@ -6,16 +6,20 @@
 /*
  * OSC 633 shell-integration 标记（统一文本协议）。
  *
- * shsh 不使用私有的带外二进制帧传递命令边界/退出码/执行权，而是把这些控制
- * 信息编码进同一条终端字节流里的 OSC 633 序列（人眼不可见；VS Code/iTerm2/
- * kitty 等终端能原生理解，其它终端忽略未知 OSC）。机器客户端（管道）解析
- * 这些序列即可精确切分命令边界，无需猜测提示符文本。
+ * 命令边界/退出码/执行权等控制信息全部编码进同一条终端字节流里的 OSC 633
+ * 序列（人眼不可见；VS Code/iTerm2/kitty 等终端能原生理解，其它终端忽略
+ * 未知 OSC）。机器客户端（管道）解析这些序列即可精确切分命令边界，
+ * 无需猜测提示符文本。
  *
  * 序列形式（终止符用 ST = ESC \\）：
  *   ESC ] 633 ; A ST                     命令行提交、即将执行
  *   ESC ] 633 ; B ST                     命令输出开始
  *   ESC ] 633 ; C ; <退出码> ST          命令结束（携带退出码）
  *   ESC ] 633 ; D ; s=<码>;u=<执行者>;w=<cwd基名> ST   提示符边界（回到空闲）
+ *   ESC ] 633 ; P ST                     命令输入已全部消费、shell 空闲
+ *                                        （send 判定"本批结束"，区别于仅按 C 计数）
+ *   ESC ] 633 ; Q ; <长度> ST            续行提示符(PS2) 起始，其后紧跟该长度
+ *                                        的可见 PS2 文本（机器客户端可抑制）
  *   ESC ] 633 ; E ; reason=<原因> ST     会话即将关闭（随后 EOF）
  *   ESC ] 633 ; W ; <rows>;x<cols> ST   （客户端→服务端）终端尺寸
  */
@@ -52,6 +56,15 @@ static inline void
 term_mark_e(const char *reason)
 {
 	outfmt(out2, SH_OSC "E;reason=%s" SH_ST, reason ? reason : "");
+}
+
+/* 输出续行提示符(PS2) 起始标记并携带其可见长度：
+ *   ESC ] 633 ; Q ; <长度> ST
+ * 紧随其后是 PS2 文本。机器客户端（send）据此精确抑制这么多可见字节。 */
+static inline void
+term_mark_q(int len)
+{
+	outfmt(out2, SH_OSC "Q;%d" SH_ST, len);
 }
 
 #endif

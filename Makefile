@@ -44,10 +44,11 @@ HELPERS  = $(BUILD)/mkinit $(BUILD)/mknodes $(BUILD)/mksyntax $(BUILD)/mksigname
 HELPER_CPPFLAGS = -DBSD=1 -DSHELL -Isrc -I$(BUILD)
 
 DASH_OBJS = $(addprefix $(BUILD)/,$(addsuffix .o,$(DASH_C) $(DASH_BLTIN))) $(GEN_O)
-SRV_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf proto pty server))
-CLI_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf proto client))
+SRV_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf pty server))
+CLI_OBJS  = $(addprefix $(BUILD)/,$(addsuffix .o,common buf osc633 client))
+SEND_OBJS = $(addprefix $(BUILD)/,$(addsuffix .o,common osc633))
 
-BIN = $(BIN_DIR)/shshd $(BIN_DIR)/shsh
+BIN = $(BIN_DIR)/shshd $(BIN_DIR)/shsh $(BIN_DIR)/send
 
 all: $(BIN)
 
@@ -104,6 +105,10 @@ $(BIN_DIR)/shsh: src/shsh.c $(CLI_OBJS)
 	@mkdir -p $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(INCS) $(CFLAGS) -o $@ src/shsh.c $(CLI_OBJS)
 
+$(BIN_DIR)/send: src/send.c $(SEND_OBJS)
+	@mkdir -p $(BIN_DIR)
+	$(CC) $(CPPFLAGS) $(INCS) $(CFLAGS) -o $@ src/send.c $(SEND_OBJS)
+
 debug: CFLAGS = -g -O0 -Wall
 debug: all
 
@@ -127,15 +132,16 @@ install: all
 	$(INSTALL) -d $(BINDIR) $(DOCDIR)/licenses
 	$(INSTALL) -m 755 $(BIN_DIR)/shsh  $(BINDIR)/shsh
 	$(INSTALL) -m 755 $(BIN_DIR)/shshd $(BINDIR)/shshd
+	$(INSTALL) -m 755 $(BIN_DIR)/send $(BINDIR)/send
 	$(INSTALL) -m 644 $(LICENSE_DOCS) $(DOCDIR)/
 	$(INSTALL) -m 644 licenses/dash-COPYING $(DOCDIR)/licenses/
-	@echo "已安装: $(BINDIR)/{shsh,shshd}"
+	@echo "已安装: $(BINDIR)/{shsh,shshd,send}"
 	@echo "许可文档: $(DOCDIR)/"
 
 uninstall:
-	rm -f $(BINDIR)/shsh $(BINDIR)/shshd
+	rm -f $(BINDIR)/shsh $(BINDIR)/shshd $(BINDIR)/send
 	rm -rf $(DOCDIR)
-	@echo "已卸载: $(BINDIR)/shsh  $(BINDIR)/shshd  及 $(DOCDIR)"
+	@echo "已卸载: $(BINDIR)/shsh  $(BINDIR)/shshd  $(BINDIR)/send  及 $(DOCDIR)"
 
 # ---- 合规二进制分发包（供 GitHub Release 上传） ----
 # 产物 dist/shsh-<ver>-linux-x86_64.tar.gz：内含 bin/ 与全部许可材料，
@@ -145,7 +151,8 @@ BINTARBALL = dist/shsh-$(VERSION)-linux-x86_64.tar.gz
 bindist: all
 	@rm -rf dist/shsh-$(VERSION)
 	@mkdir -p dist/shsh-$(VERSION)/bin dist/shsh-$(VERSION)/licenses
-	cp $(BIN_DIR)/shsh $(BIN_DIR)/shshd dist/shsh-$(VERSION)/bin/
+	cp $(BIN_DIR)/shsh $(BIN_DIR)/shshd $(BIN_DIR)/send \
+	   dist/shsh-$(VERSION)/bin/
 	cp $(LICENSE_DOCS) dist/shsh-$(VERSION)/
 	cp licenses/dash-COPYING dist/shsh-$(VERSION)/licenses/
 	tar -C dist -czf $(BINTARBALL) shsh-$(VERSION)
