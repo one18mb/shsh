@@ -589,10 +589,11 @@ static const char *sh_help_text =
     "  Ctrl+D               执行者：运行态交给前台（如 EOF）、空闲态离开；非执行者：离开\n"
     "\n"
     "会话外：\n"
-    "  shsh -l                 列出所有会话及其在线用户\n"
-    "  shsh -l <会话>          列出该会话的在线用户\n"
-    "  shsh <用户名> [会话]    加入会话（省略会话名时为默认会话）\n"
-    "  shshd [会话]            启动会话（省略会话名时为默认会话）\n";
+    "  shsh -l [-s 会话]       列出会话及在线用户\n"
+    "  shsh login -n 用户名 [-s 会话] [-d]   加入会话（-d 为 send 后台端点）\n"
+    "  shsh logout -n 用户名 [-s 会话]       停止端点\n"
+    "  shshd [-s 会话]         启动会话（省略会话名时为默认会话）\n"
+    "  send [-n 用户名 -s 会话] <命令>       非交互同步执行（见 send -h）\n";
 
 static void cmd_help(session_t *s)
 {
@@ -741,6 +742,11 @@ static bool deliver_lines(session_t *s)
                 continue;
             }
             if (line_token(line, "help", NULL)) {
+                /* help 是会话层内建、不交给 shell 执行，但仍按"已交付命令"
+                 * 发 A：回显已在上方广播，随后是帮助文本，注入空行让 shell
+                 * 空转回 PS1 时发 C/P/D。机器客户端（send）才能凭 P 正常收尾，
+                 * 否则 help 无 A/C/P，send 会一直等到超时。 */
+                phase_run_begin(s);
                 cmd_help(s);
                 inject_line(s, "\n"); /* 让 shell 回到 PS1 */
                 return true;

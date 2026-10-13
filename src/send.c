@@ -516,7 +516,8 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!endflags && strcmp(a, "--") == 0) {
             endflags = 1;
-        } else if (!endflags && strcmp(a, "-h") == 0) {
+        } else if (!endflags &&
+                   (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0)) {
             usage(stdout);
             return 0;
         } else if (!endflags && strcmp(a, "-n") == 0) {
@@ -590,7 +591,7 @@ int main(int argc, char **argv)
     if (!session[0])
         snprintf(session, sizeof session, "%s", SH_DEFAULT_SESSION);
     if (!name[0])
-        die_usage("未指定用户名：用 -n、$SHSH_NAME 或先 send login");
+        die_usage("未指定用户名：用 -n、$SHSH_NAME 或先 shsh login");
 
     if (!sh_name_valid(name))
         die_usage("非法的用户名: %s", name);

@@ -357,6 +357,38 @@ def test_shsh_logout_stops_endpoint():
         clear_sockdir()
 
 
+def test_send_session_help_builtin():
+    """send help 返回会话内 help 内建文本（非 send 自身帮助），且立即结束
+    不阻塞（help 走完整 A→C→P→D 相位）。"""
+    clear_sockdir()
+    sess = unique_session("send")
+    d = start_server(sess)
+    ep = None
+    try:
+        ep = endpoint(sess, "bot")
+        r = send(["help"], sess, "bot", timeout=10)
+        assert r.returncode == 0, r.stderr
+        assert "多用户共享 shell" in r.stdout, r.stdout
+        assert "会话内建命令" in r.stdout, r.stdout
+        assert "to <用户>" in r.stdout, r.stdout
+    finally:
+        stop_endpoint(sess, "bot")
+        if ep:
+            ep.kill()
+        kill_all([d])
+        clear_sockdir()
+
+
+def test_send_self_help_flag():
+    """send -h / --help 打印 send 自身帮助并 rc=0（不连会话）。"""
+    for arg in ("-h", "--help"):
+        r = subprocess.run([_send_bin(), arg], env=_env(),
+                           capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0, r.stderr
+        assert "用法" in r.stdout
+        assert "从 stdin 读" in r.stdout
+
+
 def test_send_session_shutdown():
     """会话关停后端点消失：send 报错退出。"""
     clear_sockdir()
