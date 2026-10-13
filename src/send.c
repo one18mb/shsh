@@ -180,6 +180,7 @@ typedef struct {
     int echo_phase;    /* 注入后、见自身首枚 A 前：其间可见字节为回显 */
     int have_to;       /* 命令是 to <目标>：完成条件是 D;u=目标 */
     char to_target[SH_NAME_MAX + 1];
+    int is_exit;       /* 命令是 exit：服务端回 E;"已退出会话"，算成功（rc=0） */
     int injected;
     int c_since_inject; /* 注入后已见的自身 C 数（P 判定结束用） */
     int done, got_e;
@@ -283,6 +284,14 @@ static void on_mark(void *ctx, int is633, char code, const uint8_t *args,
         if (!c->silent) {
             field_get(args, alen, "reason=", c->reason, sizeof c->reason);
             c->got_e = 1;
+            /* exit 是主动离开：服务端单播 E;reason="已退出会话" 后关连接，
+             * 与交互式 shsh 执行 exit 一致——交互客户端此时 rc=0 正常退出，
+             * send 也应成功返回（而非按"会话关闭"报错）。 */
+            if (c->is_exit && strcmp(c->reason, "已退出会话") == 0) {
+                c->done = 1;
+                c->mark_end_abs = c->chunk_base +
+                    (long long)((raw + rawlen) - c->chunk);
+            }
         }
     }
     if (c->done)
@@ -411,12 +420,15 @@ static int drive(pc_t *c, const paths_t *p, const char *cmd, double timeout)
         osc633_scan_feed(&scan, b, rd, c, on_raw, on_mark);
         pos += (long long)rd;
         fflush(stdout);
-        if (c->got_e)
-            die("会话关闭: %s", c->reason[0] ? c->reason : "未知原因");
         if (c->done) {
-            write_cursor(p->cur, c->mark_end_abs);
+            /* exit 主动离开后端点会 unlink 全部端点文件，不能再写游标
+             * （fopen "w" 会凭空重建一个孤儿 .cursor）。 */
+            if (!c->is_exit)
+                write_cursor(p->cur, c->mark_end_abs);
             return 0;
         }
+        if (c->got_e)
+            die("会话关闭: %s", c->reason[0] ? c->reason : "未知原因");
     }
     fprintf(stderr, "send: 执行超时（%.0fs）", timeout);
     if (c->have_exec && strcmp(c->exec, c->self) != 0)
@@ -455,6 +467,30 @@ static int to_target_of(const char *cmd, char *target, size_t tsz)
         return 1;
     }
     return 0;
+}
+
+/* 识别整段内容是否为单条 exit（服务端在 PS1 按行首词法拦截，见
+ * server.c line_token/deliver_lines）：只看第一行且其后没有别的行；
+ * 行首即 "exit"，后接结尾或空白（"exit 0" 同样离开，参数被忽略）。 */
+static int is_exit_cmd(const char *cmd)
+{
+    char line[SH_NAME_MAX + 16];
+    size_t n = 0;
+    while (cmd[n] && cmd[n] != '\n' && n < sizeof line - 1) {
+        line[n] = cmd[n];
+        n++;
+    }
+    line[n] = '\0';
+    /* 第一行之后还有内容 → 是脚本，不按 exit 处理 */
+    if (cmd[n] == '\n' && cmd[n + 1] != '\0')
+        return 0;
+    size_t m = strlen(line);
+    while (m > 0 && (line[m - 1] == ' ' || line[m - 1] == '\t' ||
+                     line[m - 1] == '\r'))
+        line[--m] = '\0';
+    if (strncmp(line, "exit", 4) != 0)
+        return 0;
+    return line[4] == '\0' || line[4] == ' ' || line[4] == '\t';
 }
 
 static void usage(FILE *f)
@@ -606,6 +642,7 @@ int main(int argc, char **argv)
     c.self = name;
     c.opt_echo = opt_l;
     c.have_to = to_target_of(text, c.to_target, sizeof c.to_target);
+    c.is_exit = is_exit_cmd(text);
 
     /* 端点存在性校验（send 不启动 shsh） */
     if (!alive(read_pid(p.pid)))

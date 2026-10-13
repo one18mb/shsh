@@ -275,6 +275,8 @@ shsh logout -n alice -s work                # 停止端点并清理文件
   时从 stdin 读。
 - 执行者不在自己时，`send <命令>` 会等待交权再投递；端点不存在则报错
   （send 不负责启动 shsh，shsh 生命周期由 shsh 自己管理）。
+- `send exit` 与交互执行 `exit` 行为一致：主动离开会话、rc=0，端点进程退出
+  并清理通道文件；会话继续存活。会话本身关停（shshd 被 kill）时 send 报错返回。
 - 游标按 `.out` 绝对偏移推进，每次只返回上次结束后的增量，OSC 标记被剥除。
 - **输入长度**：命令参数受内核单参数上限（`MAX_ARG_STRLEN`，约 **128 KiB**）
   限制，超出时 shell 直接报 `Argument list too long`（E2BIG）——这是内核硬限；

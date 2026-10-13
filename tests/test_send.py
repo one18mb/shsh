@@ -379,6 +379,81 @@ def test_send_session_help_builtin():
         clear_sockdir()
 
 
+def test_send_exit_leaves_session():
+    """send exit 与交互式 exit 行为一致：主动离开、rc=0，端点进程退出、
+    端点文件清理；会话继续存活，新端点可接管；默认无输出（回显被抑制）。"""
+    clear_sockdir()
+    sess = unique_session("send")
+    d = start_server(sess)
+    ep = None
+    try:
+        ep = endpoint(sess, "bot")
+        base = os.path.expanduser("~/.shsh/%s__%s" % (sess, "bot"))
+        r = send(["exit"], sess, "bot", timeout=10)
+        assert r.returncode == 0, "send exit 应成功: rc=%s err=%r" % (
+            r.returncode, r.stderr)
+        assert r.stderr == "", r.stderr
+        assert r.stdout == "", "默认应吞掉自身回显: %r" % r.stdout
+
+        # 端点进程自身应正常退出（rc=0），与交互执行 exit 相同
+        try:
+            rc_ep = ep.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ep.kill()
+            raise AssertionError("exit 后端点未退出")
+        assert rc_ep == 0, "端点应以 rc=0 退出，实际 %s" % rc_ep
+        ep = None
+
+        # 端点文件应被清理
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if not os.path.exists(base + ".pid"):
+                break
+            time.sleep(0.1)
+        for suf in (".in", ".out", ".cursor", ".pid", ".log"):
+            assert not os.path.exists(base + suf), suf
+
+        # 会话仍存活：新端点加入即可执行（执行权自动移交）
+        ep2 = endpoint(sess, "bot2")
+        try:
+            r2 = send(["echo AFTER_EXIT"], sess, "bot2")
+            assert r2.returncode == 0, r2.stderr
+            assert "AFTER_EXIT" in r2.stdout, r2.stdout
+        finally:
+            stop_endpoint(sess, "bot2")
+            ep2.kill()
+    finally:
+        if ep:
+            ep.kill()
+        kill_all([d])
+        clear_sockdir()
+
+
+def test_send_exit_dash_l():
+    """send -l exit 同样 rc=0（-l 保留回显，exit 前的键入可见）。"""
+    clear_sockdir()
+    sess = unique_session("send")
+    d = start_server(sess)
+    ep = None
+    try:
+        ep = endpoint(sess, "bot")
+        r = send(["-l", "exit"], sess, "bot", timeout=10)
+        assert r.returncode == 0, "rc=%s err=%r" % (r.returncode, r.stderr)
+        assert "exit" in r.stdout, r.stdout
+        try:
+            rc_ep = ep.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ep.kill()
+            raise AssertionError("exit 后端点未退出")
+        assert rc_ep == 0
+        ep = None
+    finally:
+        if ep:
+            ep.kill()
+        kill_all([d])
+        clear_sockdir()
+
+
 def test_send_self_help_flag():
     """send -h / --help 打印 send 自身帮助并 rc=0（不连会话）。"""
     for arg in ("-h", "--help"):
